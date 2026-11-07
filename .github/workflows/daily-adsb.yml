@@ -1,0 +1,32 @@
+# Daily ADS-B data job: builds yesterday (and any missing day of the last 30) for Catalonia + Andorra
+# and uploads it to the R2 bucket behind https://doppler-data.azemar.eu. Secrets: CLOUDFLARE_API_TOKEN (Workers R2 Storage: Edit).
+name: daily-adsb-data
+on:
+  schedule:
+    - cron: "30 6 * * *"   # 06:30 UTC: adsb.lol publishes day D on D+1 between ~00:20 and 03:30 UTC
+  workflow_dispatch: {}
+concurrency: { group: daily-adsb-data, cancel-in-progress: false }
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - run: pip install numpy requests pyproj
+      - run: npm install --no-save wrangler@4
+      # keep the small per-day trace counts (<tag>.counts.json) between runs: reference for the partial-day check
+      - uses: actions/cache@v4
+        with:
+          path: .cache/adsb/*.counts.json
+          key: adsb-counts-${{ github.run_id }}
+          restore-keys: adsb-counts-
+      - name: Build + upload missing days (catch-up over the last 30 days; at most 5 per run)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: a1cd2a86a35ae7d3f0d9ec23c95ac31e
+          PROJ_NETWORK: "ON"
+        run: python ref/data/daily_job.py --days 30 --max-days 5

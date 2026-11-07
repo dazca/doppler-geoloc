@@ -1,0 +1,44 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Lane D colsto browser benchmark</title>
+<pre id="out">running…</pre>
+<script type="module">
+// Serve the project root and open /web/tests/geoloc_browser_colsto.html[?region=bbox]
+// Real traffic: fixtures/real/colsto_longisland (5410 tracks, 30 h window), one-click honest events from ridges.json.
+import { parseWav } from '../engine/audio.js';
+import * as Engine from '../engine/geoloc.js';
+const out = document.getElementById('out');
+const log = (s) => { out.textContent += '\n' + s; console.log(s); };
+const D = '../../fixtures/real/colsto_longisland/';
+const J = async (u) => (await fetch(D + u)).json();
+const q = new URLSearchParams(location.search), regionKind = q.get('region') || 'circle15';
+let t = performance.now();
+const [meta, ridges, tracks] = await Promise.all([J('meta.json'), J('ridges.json'), J('tracks_2026.json')]);
+const wav = parseWav(await (await fetch(D + 'audio.wav')).arrayBuffer());
+log(`loaded ${tracks.length} tracks + ${(wav.samples.length / wav.sampleRate).toFixed(0)} s audio in ${(performance.now() - t).toFixed(0)} ms; hardwareConcurrency ${navigator.hardwareConcurrency}`);
+t = performance.now();
+const spec = await Engine.referenceSpectrogram(wav.samples, wav.sampleRate);
+log(`reference spectrogram ${(performance.now() - t).toFixed(0)} ms`);
+const events = [];
+for (const ev of [1, 2]) {
+  const pts = ridges.find((r) => r.event === ev && r.harmonic === 1).points.map(([a, f]) => [a, f]);
+  const fit = await Engine.fitEvent(pts, { cls: 'prop' });
+  events.push({ t_cpa_audio: fit.t_cpa_audio, F0: fit.F0, v_mps: fit.v_mps, cpa_m: fit.cpa_m, cls: 'prop', t_sigma_s: fit.t_sigma_s, ridge: pts });
+}
+const [w0, w1] = meta.date_utc_window.map((s) => Date.parse(s) / 1000);
+const region = regionKind === 'bbox'
+  ? { shape: 'rect', center: [(meta.bbox[0] + meta.bbox[2]) / 2, (meta.bbox[1] + meta.bbox[3]) / 2], bbox: meta.bbox }
+  : { shape: 'circle', center: [meta.true_lat, meta.true_lon], radius_m: 15000, bbox: [meta.true_lat - 0.14, meta.true_lon - 0.18, meta.true_lat + 0.14, meta.true_lon + 0.18] };
+const stages = {};
+t = performance.now();
+const res = await Engine.runSearch({ events, silences: [], region, time: { t0: w0, t1: w1 }, duration_s: wav.samples.length / wav.sampleRate,
+  tracks, spec, dem: (lat) => new Float64Array(lat.length).fill(20), settings: { grid_m: 200, c: 343, topN: 10, offsetTolS: 8, mode: 'robust' } },
+{ onProgress: (p) => { if (p.frac === 1 && stages[p.stage] == null) stages[p.stage] = Math.round(performance.now() - t); } });
+const el = performance.now() - t;
+log(`colsto ${regionKind}: runSearch ${(el / 1000).toFixed(2)} s, ${res.stats.executor} x${res.stats.workers}; stage end times ${JSON.stringify(stages)}`);
+log(`preamble ${JSON.stringify(res.stats.preamble)}`);
+log(`timings ${JSON.stringify(Object.fromEntries(Object.entries(res.stats.timings).map(([k, v]) => [k, Math.round(v)])))}; survivors ${JSON.stringify(res.stats.survivorsByStage)}`);
+log(`best ${res.candidates[0].lat.toFixed(5)},${res.candidates[0].lon.toFixed(5)} score ${res.candidates[0].score.toFixed(3)}; ${res.confidence.message}`);
+window.__laneD = { ms: el, stages };
+log('DONE');
+</script>

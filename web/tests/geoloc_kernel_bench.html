@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Lane D kernel benchmark</title>
+<pre id="out">running…</pre>
+<script type="module">
+// Scoring-kernel throughput (ns per bilinear sample) on scenario1: main thread vs one module worker vs pool.
+// Same job as web/tests/geoloc_kernel_bench.mjs (Node). Serve the project root and open this page.
+import { kernelBenchSetup, kernelBenchRun } from './geoloc_kernel_bench_lib.mjs';
+import { createGeolocPool } from '../workers/geoloc-pool.js';
+const out = document.getElementById('out');
+const log = (s) => { out.textContent += '\n' + s; };
+const fetchBuf = async (u) => new Uint8Array(await (await fetch(u)).arrayBuffer());
+const env = await kernelBenchSetup({ readJson: async (p) => (await fetch('../../' + p)).json(), readBin: (p) => fetchBuf('../../' + p) });
+log(`${navigator.userAgent}; crossOriginIsolated ${self.crossOriginIsolated}; jobs: ${env.job.S} survivors x ${env.job.E} events`);
+for (let k = 0; k < 3; k++) log('main thread: ' + JSON.stringify(kernelBenchRun(env)));
+for (const size of [1, navigator.hardwareConcurrency]) {
+  const pool = createGeolocPool({ size });
+  await pool.init(env.tracks, env.Z, env.spec, env.cfg);
+  for (let k = 0; k < 3; k++) {
+    const t = performance.now();
+    const r = await pool.score(env.job);
+    const ms = performance.now() - t;
+    log(`pool x${size}: ${ms.toFixed(0)} ms, ${(ms * 1e6 / r.evals).toFixed(2)} ns/sample (wall), samples ${(r.evals / 1e6).toFixed(1)} M`);
+  }
+  pool.close();
+}
+log('DONE');
+</script>

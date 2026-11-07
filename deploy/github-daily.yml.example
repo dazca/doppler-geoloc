@@ -1,0 +1,38 @@
+# DRAFT - not active. Copy to .github/workflows/daily-adsb.yml in a GitHub repo holding this project to schedule the
+# daily data job (ref/data/daily_job.py) on GitHub's runners. Scheduling is the owner's decision (deploy/README.md §1).
+#
+# Repository secrets needed:
+#   CLOUDFLARE_API_TOKEN   API token with "Workers R2 Storage: Edit" on account a1cd2a86a35ae7d3f0d9ec23c95ac31e
+#   CLOUDFLARE_ACCOUNT_ID  a1cd2a86a35ae7d3f0d9ec23c95ac31e
+# Cost per run: ~4-5 GB downloaded from GitHub releases per new day (streamed, not stored), ~10-15 min per day.
+# A public repo gets free Actions minutes; a private one uses the monthly quota (~15 min/day ~ 450 min/month).
+name: daily-adsb-data
+on:
+  schedule:
+    - cron: "30 6 * * *"   # 06:30 UTC: adsb.lol publishes day D on D+1 between ~00:20 and 03:30 UTC
+  workflow_dispatch: {}
+concurrency: { group: daily-adsb-data, cancel-in-progress: false }
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - run: pip install numpy requests pyproj
+      - run: npm install --no-save wrangler@4
+      # keep the small per-day trace counts (<tag>.counts.json) between runs: reference for the partial-day check
+      - uses: actions/cache@v4
+        with:
+          path: .cache/adsb/*.counts.json
+          key: adsb-counts-${{ github.run_id }}
+          restore-keys: adsb-counts-
+      - name: Build + upload missing days (catch-up over the last 30 days; at most 5 per run)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          PROJ_NETWORK: "ON"
+        run: python ref/data/daily_job.py --days 30 --max-days 5

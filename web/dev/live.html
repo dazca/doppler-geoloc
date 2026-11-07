@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Doppler Prototype</title>
+<style>
+  :root { --bg:#fff; --fg:#1a1a1a; --mute:#666; --line:#ddd; --acc:#2a62d9; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#141414; --fg:#eee; --mute:#999; --line:#333; --acc:#7aa2ff; } }
+  body { background:var(--bg); color:var(--fg); font:14px/1.45 system-ui,sans-serif; margin:0; padding:16px; max-width:1100px; }
+  h1 { font-size:18px; margin:0 0 4px; } .mute { color:var(--mute); }
+  fieldset { border:1px solid var(--line); border-radius:6px; margin:10px 0; padding:8px 12px; }
+  input[type=number] { width:7em; } button { padding:5px 12px; margin:2px 4px 2px 0; }
+  #spec { height:340px; border:1px solid var(--line); margin-top:8px; }
+  pre { background:transparent; border:1px solid var(--line); padding:8px; max-height:260px; overflow:auto; font-size:12px; white-space:pre-wrap; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+</style>
+</head>
+<body>
+<h1>Live mode prototype (Lane L, dev only)</h1>
+<div class="mute">Record a clip while aircraft pass. Live ADS-B is polled during the clip and backfilled from per-aircraft traces after it.
+ADS-B data © adsb.lol contributors, ODbL 1.0. Needs <code>?proxy=&lt;CORS proxy base&gt;</code> (adsb.lol sends no CORS header); dev: <code>node web/tests/live_proxy.mjs</code>.</div>
+
+<fieldset><legend>1. Where (coarse is fine: it only sizes the ADS-B query and the search area)</legend>
+  <div class="row">lat <input id="lat" type="number" step="0.0001" value="41.52"> lon <input id="lon" type="number" step="0.0001" value="2.10">
+  search radius km <input id="rad" type="number" value="6"> <button id="geo">Use device location</button></div>
+</fieldset>
+
+<fieldset><legend>2. Record</legend>
+  <div class="row"><button id="rec">Start recording</button><button id="stop" disabled>Stop</button>
+  <label>or WAV file (test; T_start from field) <input id="wav" type="file" accept=".wav"></label>
+  <label>T_start unix <input id="tstart" type="number" step="0.01" style="width:11em"></label></div>
+  <div id="status" class="mute">idle</div>
+</fieldset>
+
+<fieldset><legend>3. Click a Doppler ridge (fundamental) to add an event, then search</legend>
+  <div class="row"><button id="search" disabled>Run search (T_start known ±3 s)</button><button id="clear">Clear events</button></div>
+  <div id="spec"></div>
+</fieldset>
+<pre id="log"></pre>
+
+<script type="module">
+import { startRecording } from '../live/recorder.js';
+import { startPolling, finishTracks, liveSearchInput } from '../live/session.js';
+import { LiveTrackBuilder } from '../live/adsb-live.js';
+import { wallNow } from '../live/clock.js';
+import { parseWav } from '../engine/audio.js';
+import { trackRidge } from '../engine/ridge.js';
+import { fitEvent, runSearch, referenceSpectrogram } from '../engine/geoloc.js';
+import { SpectrogramView } from '../ui/spectrogram-view.js';
+
+const $ = (id) => document.getElementById(id);
+const log = (...a) => { $('log').textContent += a.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ') + '\n'; $('log').scrollTop = 1e9; };
+const base = new URLSearchParams(location.search).get('proxy') || '';
+const types = await fetch('../data/types.json').then((r) => r.json()).catch(() => null);
+const S = (window.__live = { events: [], tracks: [], audio: null, tStartUnix: null, poll: null, rec: null, result: null });
+const view = new SpectrogramView($('spec'), { mode: 'pick' });
+const center = () => [+$('lat').value, +$('lon').value];
+
+$('geo').onclick = () => navigator.geolocation.getCurrentPosition((p) => { $('lat').value = p.coords.latitude.toFixed(4); $('lon').value = p.coords.longitude.toFixed(4); });
+
+$('rec').onclick = async () => {
+  if (!base) { log('missing ?proxy='); return; }
+  S.events = []; S.result = null;
+  const [lat, lon] = center();
+  S.poll = startPolling({ base, lat, lon, nm: 25, everyS: 5, builder: new LiveTrackBuilder(),
+    onSnapshot: ({ stats, clock, aircraft }) => { S.lastPoll = { stats, clock, aircraft }; } });
+  S.rec = await startRecording({ onLevel: (rms, s) => {
+    const c = S.lastPoll?.clock;
+    $('status').textContent = `recording ${s.toFixed(0)} s, level ${(20 * Math.log10(rms + 1e-9)).toFixed(0)} dBFS, polls ${S.lastPoll?.stats.polls ?? 0}, aircraft ${S.lastPoll?.aircraft ?? 0}, clock offset ${c?.offsetMs?.toFixed(0) ?? '?'} ms (rtt ${c?.minRttMs?.toFixed(0) ?? '?'})`;
+  } });
+  $('rec').disabled = true; $('stop').disabled = false;
+};
+
+$('stop').onclick = async () => {
+  $('stop').disabled = true;
+  const a = await S.rec.stop();
+  S.poll.stop();
+  const est = S.poll.clock.estimate();
+  S.tStartUnix = (a.tStartLocalMs + (est.offsetMs ?? 0)) / 1000;
+  log('clip', { seconds: a.samples.length / a.fs, fs: a.fs, anchor: a.anchor, clock: est, T_start: S.tStartUnix });
+  await afterClip(a.samples, a.fs, S.poll.builder);
+  $('rec').disabled = false;
+};
+
+$('wav').onchange = async (e) => { // test path: synthetic WAV + T_start typed in; tracks still from live ADS-B (backfill only)
+  const w = parseWav(await e.target.files[0].arrayBuffer());
+  S.tStartUnix = +$('tstart').value || (wallNow() / 1000 - w.samples.length / w.sampleRate);
+  const b = new LiveTrackBuilder();
+  const [lat, lon] = center();
+  const p = startPolling({ base, lat, lon, nm: 25, everyS: 5, builder: b });
+  await new Promise((r) => setTimeout(r, 1500)); p.stop();
+  await afterClip(w.samples, w.sampleRate, b);
+};
+
+async function afterClip(samples, fs, builder) {
+  const dur = samples.length / fs;
+  $('status').textContent = 'backfilling traces...';
+  const t0 = performance.now();
+  const ft = await finishTracks({ builder, base, center: center(), radiusM: 15000, tStartUnix: S.tStartUnix, durationS: dur, types,
+    onProgress: (p) => { $('status').textContent = `backfill ${p.done}/${p.total}`; } });
+  S.tracks = ft.tracks; S.audio = { samples, fs };
+  log('tracks', { n: ft.tracks.length, hexes: ft.hexes.length, backfill: ft.backfill, ms: Math.round(performance.now() - t0),
+    cats: ft.tracks.reduce((o, t) => (o[t.category] = (o[t.category] || 0) + 1, o), {}) });
+  S.spec = await referenceSpectrogram(samples, fs);
+  view.setSpectrogram(S.spec, { autoLevels: true });
+  view.setView({ t0: 0, t1: dur, f0: 0, f1: 600 });
+  $('status').textContent = `clip ${dur.toFixed(1)} s, ${ft.tracks.length} tracks. Click ridges.`;
+  $('search').disabled = false;
+}
+
+view.on('pick', async ({ t, f }) => {
+  try {
+    const rg = trackRidge(S.spec, { t, f });
+    const pts = rg.points.map((p) => [p.t, p.f]);
+    const fit = await fitEvent(pts, { cls: 'prop' });
+    const ev = { t_cpa_audio: fit.t_cpa_audio, F0: fit.F0, v_mps: fit.v_mps, cpa_m: fit.cpa_m, cls: 'prop', ridge: pts, t_sigma_s: fit.t_sigma_s };
+    S.events.push(ev);
+    view.setOverlay('ev' + S.events.length, { points: fit.curve, color: '#ff4040', width: 2 });
+    log('event', { t_cpa_audio: +fit.t_cpa_audio.toFixed(2), F0: +fit.F0.toFixed(1), v: fit.point.v.toFixed(0), d: fit.point.d.toFixed(0), poorly: fit.poorly_constrained });
+  } catch (e) { log('ridge/fit failed:', e.message); }
+});
+$('clear').onclick = () => { S.events = []; view.clearOverlays(); };
+
+$('search').onclick = async () => {
+  if (!S.events.length) { log('add at least one event'); return; }
+  const input = liveSearchInput({ events: S.events, tracks: S.tracks, center: center(), regionRadiusM: +$('rad').value * 1000,
+    tStartUnix: S.tStartUnix, durationS: S.audio.samples.length / S.audio.fs, audio: S.audio });
+  $('status').textContent = 'searching...';
+  const t0 = performance.now();
+  try {
+    S.result = await runSearch(input, { onProgress: (p) => { $('status').textContent = `search: ${p.stage} ${(p.frac * 100).toFixed(0)}%`; } });
+    const b = S.result.candidates[0];
+    log('result', { ms: Math.round(performance.now() - t0), best: b && { lat: b.lat, lon: b.lon, score: b.score, flights: b.flights, dT_start: b.t_start_unix - S.tStartUnix },
+      confidence: S.result.confidence });
+    $('status').textContent = b ? `best ${b.lat.toFixed(5)}, ${b.lon.toFixed(5)} (margin ${S.result.confidence?.margin?.toFixed(3)})` : 'no candidate';
+  } catch (e) { log('search failed:', e.message); $('status').textContent = 'search failed'; }
+};
+</script>
+</body>
+</html>

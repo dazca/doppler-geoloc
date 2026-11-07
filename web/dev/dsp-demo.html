@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DSP demo: spectrogram + ridge tracking</title>
+<style>
+  :root { color-scheme: dark; --bg: #16181d; --panel: #20232a; --fg: #e6e6e6; --muted: #9aa0a6; --acc: #4fc3f7; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 13px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--fg); display: flex; flex-direction: column; height: 100vh; }
+  header { padding: 8px 12px; background: var(--panel); display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+  header h1 { font-size: 14px; margin: 0 8px 0 0; }
+  fieldset { border: 1px solid #333; border-radius: 6px; padding: 4px 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 0; }
+  legend { color: var(--muted); font-size: 11px; padding: 0 4px; }
+  label { display: inline-flex; gap: 4px; align-items: center; }
+  input[type=number] { width: 70px; } input[type=range] { width: 90px; }
+  input, select, button { font: inherit; background: #2b2f38; color: var(--fg); border: 1px solid #444; border-radius: 4px; padding: 2px 6px; }
+  button { cursor: pointer; } button:hover { border-color: var(--acc); }
+  #view { flex: 1; min-height: 240px; position: relative; }
+  footer { padding: 6px 12px; background: var(--panel); display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+  #status { color: var(--muted); white-space: pre-wrap; }
+  #drop { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(79,195,247,0.15); border: 2px dashed var(--acc); font-size: 18px; pointer-events: none; }
+  progress { width: 140px; }
+  .ridge-list { max-height: 90px; overflow: auto; font-family: ui-monospace, monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Doppler DSP demo</h1>
+  <fieldset><legend>input</legend>
+    <input type="file" id="file" accept="audio/*,video/*,.wav,.mp3,.mp4,.mov,.m4a,.webm">
+    <button id="loadFixture" title="fixtures/dsp/doppler_110.wav (needs server rooted at project)">synthetic pass</button>
+  </fieldset>
+  <fieldset><legend>STFT</legend>
+    <label>fs <select id="fs"><option>8000</option><option>12000</option><option selected>16000</option><option>22050</option></select></label>
+    <label>win <input type="number" id="nperseg" value="4096" step="256"></label>
+    <label>nfft <input type="number" id="nfft" value="8192" step="1024"></label>
+    <label>hop <input type="number" id="hop" value="512" step="64"></label>
+    <label>fmax <input type="number" id="fmax" value="2000" step="100"></label>
+    <label>whiten <select id="whiten"><option value="none">none</option><option value="freq" selected>freq median</option><option value="frame">frame median</option><option value="both">both</option></select></label>
+    <label title="running-median window for freq whitening (s); 0 = global median">win s <input type="number" id="wwin" value="0" step="30" style="width:55px"></label>
+    <label title="clip dB values above this (0 = off)">clip <input type="number" id="clip" value="0" step="5" style="width:50px"></label>
+    <button id="compute">compute</button> <progress id="prog" max="1" value="0"></progress>
+  </fieldset>
+  <fieldset><legend>display</legend>
+    <select id="cmap"><option>viridis</option><option>magma</option><option>gray</option></select>
+    <label>lo <input type="range" id="lo" min="-60" max="60" step="0.5"></label>
+    <label>hi <input type="range" id="hi" min="-60" max="80" step="0.5"></label>
+    <label>γ <input type="range" id="gamma" min="0.3" max="3" step="0.05" value="1"></label>
+    <button id="auto">auto</button>
+  </fieldset>
+  <fieldset><legend>tool</legend>
+    <label><input type="radio" name="mode" value="pan" checked>pan</label>
+    <label><input type="radio" name="mode" value="track">track ridge</label>
+    <label><input type="radio" name="mode" value="pick">pick points</label>
+    <label><input type="radio" name="mode" value="box">box zoom</label>
+    <label>harmonics <input id="harm" value="1" size="8" title="multipliers of the clicked line, e.g. 1,2,3"></label>
+    <label><input type="checkbox" id="showTruth">truth</label>
+    <button id="clear">clear</button> <button id="export">export JSON</button>
+  </fieldset>
+</header>
+<div id="view"><div id="drop">drop audio / video file</div></div>
+<footer>
+  <audio id="audio" controls preload="metadata" style="height:28px"></audio>
+  <div id="status">Load an audio or video file. Wheel = zoom time, Shift+wheel = zoom frequency, drag = pan (Shift+drag in other tools), double-click = reset.</div>
+  <div class="ridge-list" id="ridges"></div>
+</footer>
+<script type="module">
+import { decodeAudioFile } from '../engine/audio.js';
+import { trackRidge } from '../engine/ridge.js';
+import { createDspClient } from '../workers/dsp-client.js';
+import { SpectrogramView } from '../ui/spectrogram-view.js';
+
+const $ = (id) => document.getElementById(id);
+const view = new SpectrogramView($('view'));
+const dsp = createDspClient();
+const state = { audio: null, spec: null, ridges: [], picks: [], truth: null, fileName: null, timings: {} };
+const COLORS = ['#ff4081', '#ffeb3b', '#00e5ff', '#76ff03', '#ff9100', '#e040fb'];
+const status = (s) => { $('status').textContent = s; };
+
+async function loadFile(file) {
+  state.fileName = file.name;
+  status(`decoding ${file.name} (${(file.size / 1e6).toFixed(1)} MB)…`);
+  const t = performance.now();
+  const audio = await decodeAudioFile(file, { sampleRate: +$('fs').value });
+  state.timings.decodeMs = performance.now() - t;
+  state.audio = audio;
+  const a = $('audio'); if (a.src) URL.revokeObjectURL(a.src); a.src = URL.createObjectURL(file);
+  await compute();
+}
+
+async function compute() {
+  if (!state.audio) return;
+  const opts = { fs: state.audio.sampleRate, nperseg: +$('nperseg').value, nfft: Math.max(+$('nfft').value, +$('nperseg').value),
+    hop: +$('hop').value, fMax: +$('fmax').value, whiten: $('whiten').value,
+    ...(+$('wwin').value > 0 ? { whitenWindowS: +$('wwin').value } : {}), ...(+$('clip').value > 0 ? { clipDb: +$('clip').value } : {}) };
+  const t = performance.now();
+  state.spec = await dsp.stft(state.audio.samples, opts, (p) => { $('prog').value = p; });
+  state.timings.stftMs = performance.now() - t;
+  view.setSpectrogram(state.spec);
+  syncLevels();
+  redrawOverlays();
+  const m = state.audio.meta?.best;
+  status(`${state.fileName}: ${state.audio.duration.toFixed(1)} s @ ${state.audio.sampleRate} Hz, ${state.audio.channels} ch` +
+    ` | decode ${state.timings.decodeMs.toFixed(0)} ms, STFT ${state.timings.stftMs.toFixed(0)} ms (${state.spec.nT}×${state.spec.nF}, df ${state.spec.df.toFixed(2)} Hz, dt ${(state.spec.dt * 1000).toFixed(0)} ms)` +
+    (m ? ` | created ${new Date(m.unix * 1000).toISOString()} (${m.source})` : ' | no creation time metadata'));
+}
+
+function syncLevels() { const [lo, hi] = view.getLevels(); $('lo').value = lo; $('hi').value = hi; }
+$('lo').oninput = $('hi').oninput = () => view.setLevels(+$('lo').value, +$('hi').value);
+$('gamma').oninput = () => view.setGamma(+$('gamma').value);
+$('auto').onclick = () => { view.autoLevels(); syncLevels(); };
+$('cmap').onchange = () => view.setColormap($('cmap').value);
+$('compute').onclick = () => compute();
+$('fs').onchange = () => { const f = $('file').files[0]; if (f) loadFile(f); };
+$('file').onchange = () => { const f = $('file').files[0]; if (f) loadFile(f).catch((e) => status(String(e))); };
+for (const r of document.querySelectorAll('input[name=mode]')) r.onchange = () => view.setMode(r.value === 'track' ? 'pick' : r.value);
+const mode = () => document.querySelector('input[name=mode]:checked').value;
+
+async function loadUrl(url) {
+  const blob = await (await fetch(url)).blob();
+  await loadFile(new File([blob], url.split('/').pop(), { type: blob.type }));
+}
+$('loadFixture').onclick = () => loadUrl('../../fixtures/dsp/doppler_110.wav').catch((e) => status(String(e)));
+
+// drag & drop
+const drop = $('drop');
+addEventListener('dragover', (e) => { e.preventDefault(); drop.style.display = 'flex'; });
+addEventListener('dragleave', () => { drop.style.display = 'none'; });
+addEventListener('drop', (e) => { e.preventDefault(); drop.style.display = 'none'; const f = e.dataTransfer.files[0]; if (f) loadFile(f).catch((er) => status(String(er))); });
+
+// ridge tracking & picking
+function track(seed, opts = {}) {
+  const harmonics = $('harm').value.split(',').map(Number).filter((x) => x > 0);
+  const t = performance.now();
+  const r = trackRidge(state.spec, seed, { harmonics: harmonics.length ? harmonics : [1], ...opts });
+  r.ms = performance.now() - t;
+  r.color = COLORS[state.ridges.length % COLORS.length];
+  state.ridges.push(r);
+  redrawOverlays();
+  return r;
+}
+view.on('pick', ({ t, f }) => {
+  if (!state.spec) return;
+  if (mode() === 'track') {
+    const r = track({ t, f });
+    status(`ridge: ${r.points.length} pts, t ${r.points[0].t.toFixed(1)}–${r.points.at(-1).t.toFixed(1)} s, ` +
+      `threshold ${r.threshold.toFixed(1)} dB, ${r.ms.toFixed(0)} ms` + truthErrText(r));
+  } else if (mode() === 'pick') {
+    state.picks.push([t, f]); state.picks.sort((a, b) => a[0] - b[0]); redrawOverlays();
+  }
+});
+view.on('box', (b) => { view.setView(b); status(`box t ${b.t0.toFixed(2)}–${b.t1.toFixed(2)} s, f ${b.f0.toFixed(1)}–${b.f1.toFixed(1)} Hz`); });
+
+function redrawOverlays() {
+  view.clearOverlays();
+  if ($('showTruth').checked && state.truth)
+    for (const [h, f] of Object.entries(state.truth.f))
+      view.setOverlay(`truth${h}`, { points: state.truth.t.map((t, i) => [t, f[i]]), color: 'rgba(255,255,255,0.6)', width: 1, dash: [5, 5] });
+  state.ridges.forEach((r, k) => view.setOverlay(`ridge${k}`, { points: r.points, color: r.color, width: 2 }));
+  if (state.picks.length) view.setOverlay('picks', { points: state.picks, color: '#fff', markers: true, markerSize: 4, line: false });
+  $('ridges').innerHTML = state.ridges.map((r, k) => `<div style="color:${r.color}">#${k} seed (${r.seed.t.toFixed(2)} s, ${r.seed.f.toFixed(1)} Hz) ` +
+    `${r.points.length} pts ${r.points[0].t.toFixed(1)}–${r.points.at(-1).t.toFixed(1)} s${truthErrText(r)}</div>`).join('');
+}
+
+// truth comparison (synthetic fixture only)
+function truthErr(r) {
+  if (!state.truth) return null;
+  const T = state.truth, f0 = T.scenario.F0, g = T.t;
+  const p = r.points[Math.floor(r.points.length / 2)];
+  const fi = (h, t) => { const a = T.f[h], k = Math.min(g.length - 2, Math.max(0, Math.floor(t / (g[1] - g[0])))); return a[k] + (a[k + 1] - a[k]) * (t - g[k]) / (g[k + 1] - g[k]); };
+  // which harmonic is this ridge?
+  let h = Object.keys(T.f).reduce((b, k) => Math.abs(fi(k, p.t) - p.f) < Math.abs(fi(b, p.t) - p.f) ? k : b, '1');
+  const e = r.points.map((q) => Math.abs(q.f - fi(h, q.t))).sort((a, b) => a - b);
+  return { harmonic: +h, n: e.length, median: e[e.length >> 1], p95: e[Math.floor(0.95 * (e.length - 1))], max: e.at(-1), F0: f0 };
+}
+function truthErrText(r) { const e = truthErr(r); return e ? ` | vs truth h${e.harmonic}: median ${e.median.toFixed(2)} Hz, p95 ${e.p95.toFixed(2)}, max ${e.max.toFixed(2)}` : ''; }
+$('showTruth').onchange = async () => {
+  if ($('showTruth').checked && !state.truth) state.truth = await (await fetch('../../fixtures/dsp/doppler_110_truth.json')).json();
+  redrawOverlays();
+};
+$('clear').onclick = () => { state.ridges = []; state.picks = []; redrawOverlays(); };
+$('export').onclick = () => {
+  const blob = new Blob([JSON.stringify({ file: state.fileName, meta: state.audio?.meta,
+    ridges: state.ridges.map((r) => ({ seed: r.seed, params: r.params, points: r.points.map((p) => [+p.t.toFixed(4), +p.f.toFixed(3), +p.snr.toFixed(2)]) })),
+    picks: state.picks }, null, 1)], { type: 'application/json' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'ridges.json'; a.click();
+};
+
+// playback cursor
+const audioEl = $('audio');
+(function tick() { if (!audioEl.paused) view.setCursor(audioEl.currentTime); requestAnimationFrame(tick); })();
+
+window.demo = { view, state, loadUrl, loadFile, compute, track, truthErr, loadTruth: async () => { $('showTruth').checked = true; await $('showTruth').onchange(); } };
+</script>
+</body>
+</html>

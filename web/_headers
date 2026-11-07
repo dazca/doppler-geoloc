@@ -1,0 +1,35 @@
+# Cloudflare Pages response headers (https://developers.cloudflare.com/pages/configuration/headers/).
+# deploy/build.mjs replaces __WORKER_ORIGIN__ with the Worker's origin (e.g. https://overhead-data.example.workers.dev).
+#
+# CSP notes:
+#  - unpkg: only the exact Leaflet 1.9.4 files (script/style, also SRI-pinned in index.html); images host-wide (layer icons).
+#  - blob: in script-src is for the AudioWorklet module of live recording (web/live/recorder.js builds it from a Blob).
+#  - data: in img-src: favicon and the score heat map (canvas.toDataURL); blob: in media-src: playback of the user's file.
+#  - Tiles: Esri (server.arcgisonline.com) and OSM. DEM: AWS Terrain Tiles on s3.amazonaws.com.
+#  - No 'unsafe-inline' and no 'unsafe-eval': the app sets styles through the CSSOM only.
+# Cross-origin isolation (COOP/COEP) is deliberately NOT enabled; see deploy/README.md "SharedArrayBuffer".
+/*
+  Content-Security-Policy: default-src 'self'; script-src 'self' blob: https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: blob: https://unpkg.com https://server.arcgisonline.com https://tile.openstreetmap.org; connect-src 'self' https://s3.amazonaws.com https://elevation-tiles-prod.s3.amazonaws.com __WORKER_ORIGIN__; worker-src 'self' blob:; media-src 'self' blob:; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'; upgrade-insecure-requests
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: microphone=(self), geolocation=(self), camera=(), payment=(), usb=()
+  Cross-Origin-Opener-Policy: same-origin-allow-popups
+  Strict-Transport-Security: max-age=31536000; includeSubDomains
+
+# No content hashing in this static build, so code is revalidated (ETag) rather than cached for long.
+/index.html
+  Cache-Control: no-cache
+/config.js
+  Cache-Control: no-cache
+/ui/*
+  Cache-Control: public, max-age=300, must-revalidate
+/engine/*
+  Cache-Control: public, max-age=300, must-revalidate
+/workers/*
+  Cache-Control: public, max-age=300, must-revalidate
+/live/*
+  Cache-Control: public, max-age=300, must-revalidate
+/data/*
+  Cache-Control: public, max-age=86400
+/demo/*
+  Cache-Control: public, max-age=604800

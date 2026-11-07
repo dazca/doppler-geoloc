@@ -1,0 +1,18 @@
+# data, caches, test artefacts (large or third-party audio)
+fixtures/
+.cache/
+.playwright-mcp/
+deploy/dist/
+node_modules/
+__pycache__/
+.pytest_cache/
+ref/validation/cache/
+ref/validation/out/
+.wrangler/
+*.wav
+*.mp4
+*.npy
+*.npz
+.env
+.env.*
+.claude/

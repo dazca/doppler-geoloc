@@ -1,0 +1,50 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Lane D browser benchmark</title>
+<pre id="out">running…</pre>
+<script type="module">
+// Serve the project root (python -m http.server 8765) and open /web/tests/geoloc_browser.html
+import { parseWav } from '../engine/audio.js';
+import { runSearch, ENGINE_INFO } from '../engine/geoloc.js';
+import { refSpectrogram } from '../engine/geoloc/spectro.js';
+const out = document.getElementById('out');
+const log = (s) => { out.textContent += '\n' + s; console.log(s); };
+const J = async (u) => (await fetch(u)).json();
+function analyticDem(p) {
+  const R = 6371000, [lat0, lon0] = p.ref, D = Math.PI / 180, cl = Math.cos(lat0 * D);
+  return (lat, lon) => Float64Array.from(lat, (la, i) => {
+    const x = R * cl * (lon[i] - lon0) * D, y = R * (la - lat0) * D;
+    let z = p.base;
+    for (const [xi, yi, h, s] of p.hills) z += h * Math.exp(-((x - xi) ** 2 + (y - yi) ** 2) / (2 * s * s));
+    return z + p.wave[0] * Math.sin(x / p.wave[1]) * Math.cos(y / p.wave[2]);
+  });
+}
+const results = {};
+log(`${ENGINE_INFO.name} ${ENGINE_INFO.version}; hardwareConcurrency ${navigator.hardwareConcurrency}; crossOriginIsolated ${self.crossOriginIsolated}`);
+for (const name of ['scenario1', 'scenario2']) {
+  const base = `../../fixtures/${name}/`;
+  const [scen, truth, events, tracks] = await Promise.all(['scenario', 'truth', 'events_measured', 'tracks'].map((f) => J(base + f + '.json')));
+  let t = performance.now();
+  const w = parseWav(await (await fetch(base + 'audio.wav')).arrayBuffer());
+  const spec = refSpectrogram(w.samples, w.sampleRate);
+  const tSpec = performance.now() - t;
+  const [la, lo] = scen.search_center, dLa = 12000 / 111000, dLo = 12000 / (111000 * Math.cos(la * Math.PI / 180));
+  for (const mode of ['faithful', 'robust']) for (const run of [0, 1]) {
+    const stages = {};
+    t = performance.now();
+    const res = await runSearch({ events: events.map((e) => ({ ...e, cls: 'prop' })), silences: [],
+      region: { shape: 'rect', center: scen.search_center, bbox: [la - dLa, lo - dLo, la + dLa, lo + dLo] },
+      time: null, duration_s: scen.duration_s, tracks, spec, dem: analyticDem(scen.dem),
+      settings: { grid_m: 200, c: 343, topN: 10, offsetTolS: 8, mode } },
+    { onProgress: (p) => { stages[p.stage] = Math.round(performance.now() - t); } });
+    const el = performance.now() - t, b = res.candidates[0];
+    const k = 111320 * Math.cos(truth.observer.lat * Math.PI / 180);
+    const err = Math.hypot((b.lat - truth.observer.lat) * 110950, (b.lon - truth.observer.lon) * k);
+    const line = `${name} ${mode} run${run}: ${el.toFixed(0)} ms (spectrogram ${tSpec.toFixed(0)} ms not incl.), err ~${err.toFixed(0)} m, score ${b.score.toFixed(3)}, ${res.stats.executor} x${res.stats.workers}, stage end times ${JSON.stringify(stages)}, ${res.confidence.message}`;
+    log(line);
+    results[`${name}/${mode}/${run}`] = { ms: el, err, stages, executor: res.stats.executor, workers: res.stats.workers };
+  }
+}
+window.__laneD = results;
+log('DONE');
+</script>

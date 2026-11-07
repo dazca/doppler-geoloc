@@ -1,0 +1,44 @@
+# CORS + cache relay for adsb.lol (historical globe_history on GitHub releases + live API).
+# Deployed 2026-11-07 to https://doppler-data.azemar.eu (owner's account). Local: `npx wrangler dev` (see worker/README.md).
+# Tests: `node --test worker/test/worker.test.mjs`.
+name = "doppler-geoloc-data"
+main = "src/index.js"
+compatibility_date = "2026-03-05"
+
+# PRODUCTION NEEDS A CUSTOM DOMAIN: the Cache API is a no-op on *.workers.dev, so without a zone route every request
+# goes upstream (SECURITY_REVIEW M1). The zone (azemar.eu) is on this Cloudflare account.
+routes = [{ pattern = "doppler-data.azemar.eu", custom_domain = true }]
+workers_dev = false
+
+[vars]
+# Comma-separated allow-list of page origins for CORS. "https://*.x.pages.dev" matches preview deployments.
+# Never "*" in production. The default in src/lib.js (used if this is unset) is the same list.
+ALLOWED_ORIGINS = "https://doppler.azemar.eu,http://localhost:8000,http://127.0.0.1:8000,http://localhost:8080,http://127.0.0.1:8080,http://localhost:8788,http://127.0.0.1:8788,http://localhost:8765,http://127.0.0.1:8765,http://localhost:8766,http://127.0.0.1:8766"
+MAX_RANGE_BYTES = "8388608"
+
+# Per-IP rate limits (Workers Rate Limiting binding; period must be 10 or 60 s). Keep in sync with LIMITS in
+# src/lib.js, which is also the in-isolate fallback when a binding is missing. namespace_id: any unique integer per account.
+[[ratelimits]]
+name = "RL_TILE"        # /adsb/tile + /adsb/index
+namespace_id = "91301"
+simple = { limit = 240, period = 60 }
+
+[[ratelimits]]
+name = "RL_RANGE"       # /adsb/range (generic historical path)
+namespace_id = "91302"
+simple = { limit = 600, period = 60 }
+
+[[ratelimits]]
+name = "RL_LIVE"        # /v2/point (app polls every 5 s)
+namespace_id = "91303"
+simple = { limit = 30, period = 60 }
+
+[[ratelimits]]
+name = "RL_TRACE"       # /data/traces
+namespace_id = "91304"
+simple = { limit = 60, period = 60 }
+
+# Pre-built per-cell index shards and tiles (ref/data/build_index.py, build_tiles.py).
+[[r2_buckets]]
+binding = "INDEX"
+bucket_name = "doppler-adsb-index"
