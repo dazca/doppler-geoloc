@@ -217,6 +217,7 @@ async function loadMedia(file, { demo = null, keepProject = false, forceRange = 
     // streamable = decodeAudioFile can stream it: an MP4/MOV only if its moov has an AAC sample table we can read
     // (LPCM / other codecs / fragmented MP4 are decoded whole, which the memory estimate must know)
     const streamable = meta?.container === 'isobmff' ? !!track : /\.wav$/i.test(file.name || '');
+    track = null;                        // the sample table can be large; decodeAudioFile parses its own copy
     if (forceRange || (!crop && isLarge(file, estDur, streamable))) {
       busy(null);
       const choice = await askLargeFile(file, estDur, crop, streamable);

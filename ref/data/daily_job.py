@@ -2,7 +2,8 @@
 
 Idempotent and catch-up by design: for each day in the last --days UTC days (default 30, ending yesterday), newest
 first, it asks the live Worker whether <prod tag>/day.json AND <mlatonly tag>/day.json exist. Days that have both are
-skipped (except a prod day.json with status "partial" younger than 7 days: rebuilt in case adsb.lol re-published it).
+skipped (except a prod day.json with status "partial" younger than 7 days, unless the cause is upstream corruption:
+rebuilt in case adsb.lol re-published it).
 If the Worker cannot answer (429/5xx/network) the day is skipped this run, never rebuilt blindly. Any other day is
 built and uploaded:
   1. stream the adsb.lol prod and mlatonly tars ONCE each (~3-5 GB in total; nothing is written to disk but the index),
@@ -176,7 +177,7 @@ def day_json(worker, bucket, day, feed, tries=3, r2=None):
 
 def day_done(worker, day, today=None, tries=3, bucket=BUCKET):
     """The prod status ("ok"/"partial"/"empty"/"missing", truthy) if both day.json exist (and prod is not a recent
-    'partial'); False otherwise. Raises WorkerUnavailable."""
+    'partial' that is not caused by upstream corruption); False otherwise. Raises WorkerUnavailable."""
     today = today or dt.datetime.now(dt.timezone.utc).date()
     prod = day_json(worker, bucket, day, "prod", tries)
     if prod is None:

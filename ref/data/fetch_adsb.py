@@ -855,16 +855,26 @@ PARTIAL_RATIO = {"prod": 0.65, "mlatonly": 0.2, "staging": 0.65}  # mlatonly siz
 _COUNT_CACHE = {}
 
 
-def index_counts(path):
-    """(n_traces, total_bytes) of a cached index, memoised."""
+def _index_summary(path):
     if path not in _COUNT_CACHE:
         try:
             with gzip.open(path, "rt", encoding="utf-8") as f:
                 d = json.load(f)
-            _COUNT_CACHE[path] = (len(d["traces"]), sum(sz for _, sz in d["parts"]))
+            _COUNT_CACHE[path] = (len(d["traces"]), sum(sz for _, sz in d["parts"]),
+                                  (d.get("n_corrupt", 0), d.get("tar_skipped_bytes", 0), d.get("tar_resync_failed", False)))
         except (OSError, ValueError, KeyError):
-            _COUNT_CACHE[path] = (None, None)
+            _COUNT_CACHE[path] = (None, None, None)
     return _COUNT_CACHE[path]
+
+
+def index_counts(path):
+    """(n_traces, total_bytes) of a cached index, memoised."""
+    return _index_summary(path)[:2]
+
+
+def index_corruption(path):
+    """(n_corrupt, tar_skipped_bytes, tar_resync_failed) recorded in a cached index, or None."""
+    return _index_summary(path)[2]
 
 
 def _day_of(path):
@@ -915,7 +925,7 @@ def corruption_status(st, n_traces, n_corrupt=0, skipped_bytes=0, size_bytes=0, 
     st["note"] = f"{st['note']}; {msg}" if st.get("note") else msg
     if st.get("status") == "ok" and (lost > PARTIAL_LOSS or resync_failed):
         st["status"] = "partial"
-        st["partial_reason"] = "corrupt"   # immutable upstream defect: rebuilding cannot improve it"
+        st["partial_reason"] = "corrupt"   # immutable upstream defect: rebuilding cannot improve it
     return st
 
 
@@ -1080,6 +1090,7 @@ def fetch(bbox, t0, t1, feeds=("prod", "mlatonly"), cache=DEFAULT_CACHE, max_alt
                 if not os.path.exists(p):
                     per_feed.append(stream_day(s, day, feed, bbox, t0, t1, cache, log, keep_ground))
                     n, size = index_counts(p)
+                    corr = index_corruption(p)
                 else:
                     with gzip.open(p, "rt", encoding="utf-8") as f:
                         idx = json.load(f)
