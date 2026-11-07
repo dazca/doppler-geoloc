@@ -24,6 +24,12 @@ For production this would be a daily GitHub Action / cron box (see docs/DATA.md 
   - Extra or reordered query params cannot force a miss.
   - Responses carry `X-Cache: HIT|MISS`.
   - Cache writes use `ctx.waitUntil`.
+  - R2 misses (tile/index "not built yet" 404) are cached 300 s (coverage manifest: 60 s) to save R2 reads.
+  - On a hit the route's own `Cache-Control` is re-applied (the zone's 4 h Browser Cache TTL rewrites stored copies).
+- **Errors:** a throwing upstream fetch / R2 read returns `502 {"error":"upstream error"}` with CORS and `Retry-After: 5`.
+- **Rate-limit key:** IPv4; IPv6 by /64; IPv4-embedded IPv6 (`::ffff:a.b.c.d`, NAT64 `64:ff9b::a.b.c.d`) by the IPv4.
+- **Licence headers:** R2-served data carries `Link: <https://opendatacommons.org/licenses/odbl/1-0/>; rel="license"`
+  and `X-Source: adsb.lol` (both CORS-exposed).
 - **Rate limits:** per IP and per route. `[[ratelimits]]` bindings run alongside an always-on in-isolate token
   bucket. Over budget → 429 with `Retry-After`.
 - **CORS:** an explicit allow-list (`ALLOWED_ORIGINS`; wildcard subdomains are supported). The default is not `*`.
