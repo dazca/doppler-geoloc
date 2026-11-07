@@ -29,7 +29,7 @@ function cors(req, env, h = new Headers()) {
   if (ao) h.set('Access-Control-Allow-Origin', ao);
   h.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
   h.set('Access-Control-Max-Age', '86400');
-  h.set('Access-Control-Expose-Headers', 'Date, X-Server-Time-Ms, Retry-After');
+  h.set('Access-Control-Expose-Headers', 'Date, X-Server-Time-Ms, Retry-After, Link, X-Source');
   h.set('Vary', 'Origin');
   return h;
 }
@@ -38,14 +38,17 @@ const err = (req, env, status, msg, extra = {}) =>
   new Response(JSON.stringify({ error: msg }), {
     status, headers: cors(req, env, new Headers({ 'Content-Type': 'application/json', ...extra })) });
 
-/** Cache-first: `produce()` -> Response to cache (or an error Response, which is returned uncached). */
+/**
+ * Cache-first: `produce()` -> Response to cache (or an error Response, which is returned uncached).
+ * A 404 that carries its own Cache-Control (R2 "not built yet") is cached too: it saves an R2 read per repeat miss.
+ */
 async function cached(ctx, key, produce) {
   const cache = globalThis.caches?.default;
   const k = new Request(key, { method: 'GET' });
   let res = cache ? await cache.match(k) : null;
   if (res) return { res, hit: true };
   res = await produce();
-  if (res.ok && cache) {
+  if (cache && (res.ok || (res.status === 404 && res.headers.has('Cache-Control')))) {
     const p = cache.put(k, res.clone());
     if (ctx?.waitUntil) ctx.waitUntil(p); else await p; // a cancelled client must not drop the cache write
   }
@@ -61,14 +64,18 @@ async function range(r) {
     'Cache-Control': 'public, max-age=31536000, immutable', 'X-Source': 'adsb.lol globe_history (ODbL 1.0)' } });
 }
 
+const ODBL = { Link: '<https://opendatacommons.org/licenses/odbl/1-0/>; rel="license"', 'X-Source': 'adsb.lol' };
+const R2_MISS_TTL = 300; // s; a day is built once a day, so a short negative cache is safe (coverage stays <= its 60 s)
+
 async function r2(env, r) {
   if (!env.INDEX) return new Response(JSON.stringify({ error: 'index bucket not configured' }), { status: 501 });
   const obj = await env.INDEX.get(r.r2key);
-  if (!obj) return new Response(JSON.stringify({ error: `no ${r.route} for this day/cell (not built yet)` }), { status: 404 });
+  if (!obj) return new Response(JSON.stringify({ error: `no ${r.route} for this day/cell (not built yet)` }), { status: 404,
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': `public, max-age=${Math.min(R2_MISS_TTL, r.ttl || R2_MISS_TTL)}` } });
   // Tiles are stored gzipped. They are cached as opaque bytes (X-Body-Gzip) and only labelled Content-Encoding: gzip
   // when served, so the Cache API never re-encodes or decodes them.
   const h = { 'Content-Type': r.route === 'tile' ? 'application/octet-stream' : 'application/json',
-    'Cache-Control': `public, max-age=${r.ttl || 86400}` };
+    'Cache-Control': `public, max-age=${r.ttl || 86400}`, ...ODBL };
   if (r.route === 'tile') h['X-Body-Gzip'] = '1';
   return new Response(await obj.arrayBuffer(), { headers: h });
 }
@@ -94,7 +101,13 @@ export async function handle(req, env = {}, ctx = undefined, limiter = buckets) 
   if (!lim.ok) return err(req, env, 429, 'rate limited, slow down', { 'Retry-After': String(lim.retryAfterS) });
 
   const produce = r.route === 'range' ? () => range(r) : (r.route === 'tile' || r.route === 'index') ? () => r2(env, r) : () => live(r);
-  const { res, hit } = await cached(ctx, r.key, produce);
+  let res, hit;
+  try {
+    ({ res, hit } = await cached(ctx, r.key, produce));
+  } catch {
+    // upstream fetch / R2 / Cache API threw: answer with CORS so the browser sees a retryable error, not an opaque 1101
+    return err(req, env, 502, 'upstream error', { 'Retry-After': '5' });
+  }
   const h = cors(req, env, new Headers(res.headers));
   h.set('X-Cache', hit ? 'HIT' : 'MISS');
   const gz = h.get('X-Body-Gzip') === '1';

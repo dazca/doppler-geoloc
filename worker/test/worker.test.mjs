@@ -135,3 +135,56 @@ test('IPv6 clients share one rate-limit key per /64', async () => {
   assert.equal(clientKey('2001:db8::1'), '2001:db8:0:0::/64');
   assert.equal(clientKey('2001:0db8:0001:0002::9'), '2001:db8:1:2::/64');
 });
+
+test('IPv6 with an embedded IPv4 (mapped / NAT64) is keyed by the IPv4', async () => {
+  const { clientKey } = await import('../src/lib.js');
+  assert.equal(clientKey('::ffff:1.2.3.4'), '1.2.3.4');
+  assert.equal(clientKey('64:ff9b::198.51.100.9'), '198.51.100.9');
+  assert.equal(clientKey('::FFFF:203.0.113.1'), '203.0.113.1');
+});
+
+test('handler: upstream / R2 throwing -> 502 with CORS + Retry-After (not an opaque 500)', async () => {
+  stubs();
+  globalThis.fetch = async () => { throw new TypeError('network down'); };
+  const o = { Origin: 'http://localhost:8000', 'CF-Connecting-IP': '5.5.5.5' };
+  const r1 = await handle(new Request(`https://w.example/adsb/range?tag=${TAG}&start=0&end=9`, { headers: o }), {}, undefined, new TokenBuckets());
+  const env = { INDEX: { get: async () => { throw new Error('R2 down'); } } };
+  const r2 = await handle(new Request('https://w.example/adsb/tile/2026-11-01/263364.json', { headers: o }), env, undefined, new TokenBuckets());
+  for (const r of [r1, r2]) {
+    assert.equal(r.status, 502);
+    assert.equal(r.headers.get('Retry-After'), '5');
+    assert.equal(r.headers.get('Access-Control-Allow-Origin'), 'http://localhost:8000');
+    assert.deepEqual(await r.json(), { error: 'upstream error' });
+  }
+});
+
+test('handler: R2 404 is cached 300 s (one R2 read); coverage 404 stays <= 60 s; 200 carries ODbL Link + X-Source', async () => {
+  const { store } = stubs();
+  let reads = 0;
+  const tile = new TextEncoder().encode('{}').buffer;
+  const env = { INDEX: { get: async (k) => { reads++; return k === 'tiles/2026-11-01/263364.json.gz' ? { arrayBuffer: async () => tile } : null; } } };
+  const go = (p) => handle(new Request(`https://w.example${p}`, { headers: { Origin: 'https://doppler.azemar.eu' } }),
+    { ...env, ALLOWED_ORIGINS: 'https://doppler.azemar.eu' }, undefined, new TokenBuckets());
+  const a = await go('/adsb/tile/2026-11-02/263364.json'), b = await go('/adsb/tile/2026-11-02/263364.json');
+  assert.deepEqual([a.status, b.status, reads], [404, 404, 1]);
+  assert.deepEqual([a.headers.get('X-Cache'), b.headers.get('X-Cache')], ['MISS', 'HIT']);
+  assert.equal(a.headers.get('Cache-Control'), 'public, max-age=300');
+  assert.equal(b.headers.get('Access-Control-Allow-Origin'), 'https://doppler.azemar.eu');
+  const c = await go('/adsb/index/meta/coverage.json');
+  assert.deepEqual([c.status, c.headers.get('Cache-Control')], [404, 'public, max-age=60']);
+  const ok = await go('/adsb/tile/2026-11-01/263364.json');
+  assert.equal(ok.status, 200);
+  assert.equal(ok.headers.get('Cache-Control'), 'public, max-age=86400');
+  assert.equal(ok.headers.get('Link'), '<https://opendatacommons.org/licenses/odbl/1-0/>; rel="license"');
+  assert.equal(ok.headers.get('X-Source'), 'adsb.lol');
+  assert.match(ok.headers.get('Access-Control-Expose-Headers'), /Link, X-Source/);
+  assert.ok(store.has('https://cache.internal/adsb/tile/2026-11-02/263364.json'));
+});
+
+test('handler: upstream errors on non-R2 routes are still not cached', async () => {
+  const { store } = stubs();
+  globalThis.fetch = async () => new Response('x', { status: 404 });
+  const r = await handle(new Request(`https://w.example/adsb/range?tag=${TAG}&start=0&end=9`), {}, undefined, new TokenBuckets());
+  assert.equal(r.status, 404);
+  assert.equal(store.size, 0);
+});

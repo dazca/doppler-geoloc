@@ -138,9 +138,14 @@ export async function checkLimit(env, buckets, route, ip) {
   return local;
 }
 
-/** Rate-limit key: IPv4 as is, IPv6 reduced to its /64 (one subscriber usually owns a whole /64). */
+/**
+ * Rate-limit key: IPv4 as is, IPv6 reduced to its /64 (one subscriber usually owns a whole /64).
+ * IPv6 with an embedded IPv4 (::ffff:1.2.3.4, NAT64 64:ff9b::1.2.3.4) -> the IPv4, so all NAT64 users are not one key.
+ */
 export function clientKey(ip) {
   if (!ip.includes(':')) return ip;
+  const last = ip.slice(ip.lastIndexOf(':') + 1);
+  if (last.includes('.')) return last;
   let [head, tail = ''] = ip.toLowerCase().split('::');
   const h = head ? head.split(':') : [], t = tail ? tail.split(':') : [];
   const full = ip.includes('::') ? [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t] : h;
