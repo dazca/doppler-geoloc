@@ -26,7 +26,19 @@ export async function nodeWorkerFactory() {
   };
 }
 
-const defaultSize = () => Math.max(1, Math.min(16, (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4));
+const nav = () => (typeof navigator !== 'undefined' ? navigator : {});
+const defaultSize = () => Math.max(1, Math.min(16, nav().hardwareConcurrency || 4));
+const canShare = () => typeof SharedArrayBuffer !== 'undefined' && globalThis.crossOriginIsolated !== false;
+
+/**
+ * Workers for a whitened spectrogram of zBytes (B3). Without SharedArrayBuffer each worker gets its own copy of Z, so
+ * the copies are kept within ~10 % of the device memory (navigator.deviceMemory, 4 GB when unknown); never below 1.
+ */
+export function poolSizeFor(zBytes = 0, { cpus = defaultSize(), deviceMemoryGB = nav().deviceMemory, shared = canShare() } = {}) {
+  if (shared || !(zBytes > 0)) return cpus;
+  const budget = (deviceMemoryGB ?? 4) * 1e9 * 0.10;
+  return Math.max(1, Math.min(cpus, Math.floor(budget / zBytes)));
+}
 
 export function createGeolocPool({ size = defaultSize(), factory = browserWorkerFactory } = {}) {
   const workers = [];

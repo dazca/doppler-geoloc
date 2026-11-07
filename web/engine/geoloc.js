@@ -116,7 +116,18 @@ export async function fetchFlights(query, { signal, onProgress } = {}) {
 const zCache = new WeakMap();
 /** Crop the contract spectrogram to [.., fMax] and whiten it per bin (median/MAD, clip [-3, 8]). Cached per object. */
 export function prepareSpectrogram(spec, fMax = Infinity) {
-  if (spec.unit === 'z') return { spec, Z: spec.data };
+  if (spec.unit === 'z') {     // already whitened (e.g. in the DSP worker): whitening is per bin, so only crop the band
+    const nF = Math.min(spec.nF, Math.max(2, Math.floor((fMax - spec.f0) / spec.df) + 2));
+    const { data, ...meta } = spec;
+    if (nF >= spec.nF) return { spec: meta, Z: data };
+    const hit = zCache.get(data);
+    if (hit && hit.nF === nF) return hit;
+    const Z = new Float32Array(spec.nT * nF);
+    for (let i = 0; i < spec.nT; i++) Z.set(data.subarray(i * spec.nF, i * spec.nF + nF), i * nF);
+    const out = { spec: { ...meta, nF }, Z, nF };
+    zCache.set(data, out);
+    return out;
+  }
   const key = spec.data;
   const hit = zCache.get(key);
   if (hit && hit.fMax >= fMax) return hit;
@@ -145,12 +156,36 @@ export async function referenceSpectrogram(samples, fs, { fmax = 1000 } = {}) {
 }
 
 // ------------------------------------------------------------------ executor (worker pool)
-let poolPromise = null;
-async function getExecutor(nWorkers) {
+// B3: without SharedArrayBuffer every worker holds its own copy of Z, so the pool is sized by Z.byteLength against
+// the device memory (geoloc-pool.js#poolSizeFor); releaseEngine() terminates it (new file / new project).
+let pool = null, poolSize = 0;
+async function getExecutor(nWorkers, zBytes = 0) {
   if (nWorkers === 0 || typeof Worker === 'undefined') return createInlineExecutor();
-  poolPromise ||= import('../workers/geoloc-pool.js').then(({ createGeolocPool }) => createGeolocPool(nWorkers ? { size: nWorkers } : {}))
-    .catch((e) => { console.warn('[geoloc] worker pool unavailable, running inline:', e); poolPromise = null; return null; });
-  return (await poolPromise) || createInlineExecutor();
+  let mod;
+  try { mod = await import('../workers/geoloc-pool.js'); } catch (e) { console.warn('[geoloc] worker pool unavailable, running inline:', e); return createInlineExecutor(); }
+  const want = nWorkers || mod.poolSizeFor(zBytes);
+  if (pool && poolSize !== want) { pool.close(); pool = null; }
+  if (!pool) { pool = mod.createGeolocPool({ size: want }); poolSize = want; }
+  return pool;
+}
+/** Terminate the worker pool and drop every per-recording cache (call when the recording changes). */
+export function releaseEngine() { pool?.close(); pool = null; poolSize = 0; }
+
+// Z rows the workers can touch: scoring samples lie within +-tau_half of each event's delayed CPA, shifted by at most
+// delta_half and the offset gate (whole-recording uses such as the verdict's time-shift null keep the full Z).
+const zCropCache = new WeakMap();
+export function cropZToEvents(zs, Z, events, cfg = {}) {
+  const ts = events.map((e) => e.t_cpa_audio).filter(Number.isFinite);
+  if (!ts.length) return { zs, Z };
+  const margin = (cfg.tau_half ?? 60) + Math.max(cfg.delta_half ?? 4, cfg.soft?.delta_half_coarse ?? 12) + (cfg.soft?.offset_gate ?? 30) + 60;
+  const i0 = Math.max(0, Math.floor((Math.min(...ts) - margin - zs.t0) / zs.dt) - 2);
+  const i1 = Math.min(zs.nT, Math.ceil((Math.max(...ts) + margin - zs.t0) / zs.dt) + 3);
+  if (i1 - i0 < 2 || (i1 - i0) > 0.7 * zs.nT) return { zs, Z };   // not worth a copy
+  const key = `${i0}:${i1}`, hit = zCropCache.get(Z);
+  if (hit?.key === key) return hit.out;
+  const out = { zs: { ...zs, t0: zs.t0 + i0 * zs.dt, nT: i1 - i0 }, Z: Z.slice(i0 * zs.nF, i1 * zs.nF) };
+  zCropCache.set(Z, { key, out });
+  return out;
 }
 
 // ------------------------------------------------------------------ DEM
@@ -169,7 +204,8 @@ const EVENT_CATS = { prop: ['prop', 'unknown'], heli: ['heli', 'unknown'], jet: 
 /**
  * input: see geoloc-api.md §3. Extras accepted: input.dem (fn(lat[], lon[]) or {elevations}), input.audio = {samples, fs}
  * (engine computes the reference spectrogram), settings.mode = 'robust' (default) | 'faithful',
- * settings.useRidgeFit (default true), settings.workers (0 = inline), settings.config (raw search.js overrides).
+ * settings.useRidgeFit (default true), settings.workers (0 = inline), settings.config (raw search.js overrides),
+ * settings.cropZ (default true: workers get only the Z rows near the events), input.whitened (unit 'z' copy of input.spec).
  */
 export async function runSearch(input, { signal, onProgress, exec: execIn } = {}) {
   const T0 = performance.now();
@@ -232,7 +268,9 @@ export async function runSearch(input, { signal, onProgress, exec: execIn } = {}
     if (!spec && input.audio) spec = await referenceSpectrogram(input.audio.samples, input.audio.fs);
     if (!spec) throw new Error('runSearch needs input.spec (contract spectrogram) or input.audio {samples, fs}.');
     lap('ridge_refit');
-    const { spec: zs, Z } = prepareSpectrogram(spec, fNeed);
+    // input.whitened: the same grid already whitened (UI: DSP worker, B11); whitening is per bin, so cropping it is exact
+    const w = input.whitened, sameGrid = w && w.unit === 'z' && w.nT === spec.nT && w.nF === spec.nF && w.t0 === spec.t0 && w.dt === spec.dt && w.f0 === spec.f0 && w.df === spec.df;
+    const { spec: zs, Z } = prepareSpectrogram(sameGrid ? w : spec, fNeed);
     lap('whiten');
     if (signal?.aborted) throw abortErr();
 
@@ -292,16 +330,17 @@ export async function runSearch(input, { signal, onProgress, exec: execIn } = {}
       else notes.push(`event ${i + 1}: no track with registration/callsign ${ev.reg} in the data; hint ignored`);
     }
     const dem = await demFunction(input);
-    const exec = execIn || await getExecutor(st.workers);  // opts.exec: executor injection (tests, Node worker pool)
-    lap('executor');
     // D11 montage: events from different clips (event.clip) have independent start times
     const clipIds = new Set(events.map((e) => e.clip).filter((x) => x != null));
     const montage = clipIds.size >= 2;
+    const { zs: zw, Z: Zw } = montage || st.cropZ === false ? { zs, Z } : cropZToEvents(zs, Z, events, makeConfig(cfg));
+    const exec = execIn || await getExecutor(st.workers, Zw.byteLength);  // opts.exec: executor injection (tests, Node worker pool)
+    lap('executor');
     if (montage) { events.forEach((e) => { if (e.clip == null) e.clip = '_'; }); notes.push(`montage: ${clipIds.size} clips, each with its own unknown start time`); }
     const durationS = input.duration_s || zs.t0 + zs.nT * zs.dt;
     const r = montage
       ? await runMontageCore(tracks, dem, events, Z, zs, enu, center, durationS, cfg, { exec, signal, onProgress: prog, mask, topN: st.topN || 10 }, input.clips || [])
-      : await runSearchCore(tracks, dem, events, Z, zs, enu, center, durationS, cfg,
+      : await runSearchCore(tracks, dem, events, Zw, zw, enu, center, durationS, cfg,
         { exec, signal, onProgress: prog, mask, topN: st.topN || 10, rawSpec: spec });
     if (exec.kind === 'inline') exec.close();
 

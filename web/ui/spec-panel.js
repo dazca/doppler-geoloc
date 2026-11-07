@@ -13,9 +13,19 @@ export const PRESETS = {
   fast: { label: 'Fast overview', nperseg: 1024, nfft: 2048, hop: 1024 },
 };
 
+/** B5: the displayed spectrogram (nT x nF Float32) is kept within this many bytes by widening the hop. */
+export const SPEC_BUDGET_BYTES = 100e6;
+
+/** Smallest hop (multiple of 256, >= the preset's) that keeps nT*nF*4 <= SPEC_BUDGET_BYTES for `duration` s. */
+export function budgetHop(p, duration, { fs = DECODE_RATE, fMin = 30, fMax = 2000, budget = SPEC_BUDGET_BYTES } = {}) {
+  const nF = Math.floor(fMax * p.nfft / fs) - Math.ceil(fMin * p.nfft / fs) + 1;
+  const need = (duration * fs * nF * 4) / budget;
+  return Math.max(p.hop, Math.ceil(need / 256) * 256);
+}
+
 export function stftOptions(specSettings, duration) {
   const p = PRESETS[specSettings.preset] || PRESETS.standard;
-  const hop = duration > 2400 && p.hop < 1024 ? 1024 : p.hop;   // keep long files under ~100 MB
+  const hop = budgetHop(p, duration);
   return {
     fs: DECODE_RATE, nperseg: p.nperseg, nfft: p.nfft, hop, fMin: 30, fMax: 2000, whiten: 'freq',
     ...(specSettings.hum ? { whitenWindowS: 120 } : {}),
@@ -47,20 +57,27 @@ export function createSpecPanel(host, { onPick, onBox, onHover, onView } = {}) {
   let raf = 0, follow = true;
   const compose = () => view.setOverlays([...bands, ...lines]);
 
-  // track worker: a tiny promise client
+  // track worker: a tiny promise client. It holds the only worker-side copy of the spectrogram (ridge + autodetect).
   const pending = new Map();
   let nextId = 1;
-  function trackCall(msg) {
+  const dropTracker = (err) => {
+    tracker?.terminate(); tracker = null;
+    for (const p of pending.values()) p.reject(err);
+    pending.clear();
+  };
+  function trackCall(msg, onProgress) {
     if (!tracker) {
       tracker = new Worker(new URL('../workers/track.worker.js', import.meta.url), { type: 'module' });
       tracker.onmessage = (ev) => {
         const p = pending.get(ev.data.id); if (!p) return;
+        if (ev.data.type === 'progress') { p.onProgress?.(ev.data.p); return; }
         pending.delete(ev.data.id);
         ev.data.type === 'result' ? p.resolve(ev.data.result) : p.reject(new Error(ev.data.message));
       };
-      tracker.onerror = (e) => { for (const p of pending.values()) p.reject(new Error(e.message || 'track worker error')); pending.clear(); };
+      tracker.onerror = (e) => dropTracker(new Error(e.message || 'track worker error'));
+      if (spec && msg.type !== 'spec') tracker.postMessage({ id: 0, type: 'spec', spec });   // re-created after an abort
     }
-    return new Promise((resolve, reject) => { const id = nextId++; pending.set(id, { resolve, reject }); tracker.postMessage({ ...msg, id }); });
+    return new Promise((resolve, reject) => { const id = nextId++; pending.set(id, { resolve, reject, onProgress }); tracker.postMessage({ ...msg, id }); });
   }
 
   function tick() {
@@ -94,7 +111,22 @@ export function createSpecPanel(host, { onPick, onBox, onHover, onView } = {}) {
     },
     /** One-click ridge with auto-extension (web/engine/ridge-extend.js), in the track worker. */
     ridge(seed, opts) { if (!spec) throw new Error('No spectrogram'); return trackCall({ type: 'extend', seed, opts }); },
-    clear() { spec = null; lines = new Map(); bands = new Map(); view.setOverlays([]); view.setSpectrogram(null, { autoLevels: false }); view.setCursor(null); },
+    /** Pass auto-detection (docs/AUTODETECT.md) on the track worker's copy of the spectrogram; abort = terminate it. */
+    detect(opts, { onProgress, signal } = {}) {
+      if (!spec) return Promise.reject(new Error('No spectrogram'));
+      if (signal?.aborted) return Promise.reject(new DOMException('Detection cancelled', 'AbortError'));
+      const p = trackCall({ type: 'autodetect', opts }, onProgress);
+      signal?.addEventListener('abort', () => dropTracker(new DOMException('Detection cancelled', 'AbortError')), { once: true });
+      return p;
+    },
+    /** Reference spectrogram + its whitened copy for scoring, computed in the DSP worker (B11). */
+    reference(samples, fs) { dsp ||= createDspClient(); return dsp.refspec(samples, fs); },
+    /** Drop the spectrogram everywhere (view, track worker, DSP worker) and stop playback. */
+    clear() {
+      spec = null; lines = new Map(); bands = new Map(); view.setOverlays([]); view.setSpectrogram(null, { autoLevels: false }); view.setCursor(null);
+      dropTracker(new DOMException('Spectrogram cleared', 'AbortError'));
+      dsp?.terminate(); dsp = null;
+    },
     setLines(map) { lines = map; compose(); },
     setBands(list) { bands = new Map(list.map((b, i) => [`band-${i}`, { type: 'band', ...b }])); compose(); },
     setMode(m) { view.setMode(m === 'mark' || m === 'cut' ? 'pick' : m === 'silence' ? 'box' : 'pan'); host.dataset.mode = m; },

@@ -63,3 +63,18 @@ export function fmtDuration(s) {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = Math.round(s % 60);
   return h ? `${h} h ${m} min` : `${m} min ${r} s`;
 }
+
+/** 'h:mm:ss' | 'm:ss' | 's' (decimals allowed) -> seconds, or null. */
+export function parseClock(str) {
+  const m = /^\s*(\d+(?:\.\d+)?)(?::(\d+(?:\.\d+)?))?(?::(\d+(?:\.\d+)?))?\s*$/.exec(str || '');
+  if (!m) return null;
+  return [m[1], m[2], m[3]].filter((x) => x != null).map(Number).reduce((acc, x) => acc * 60 + x, 0);
+}
+/** B10: why [a, b] is not a usable analysis range of a recording of `dur` s (null/0 = unknown): an i18n key, or null. */
+export function cropRangeError(a, b, dur) {
+  if (a == null || b == null || !Number.isFinite(a) || !Number.isFinite(b)) return 'large.bad';
+  if (dur > 0 && a >= dur) return 'large.past';
+  if (!(b > a)) return 'large.order';
+  if (dur > 0 && Math.min(b, dur) - a < 1) return 'large.order';
+  return null;
+}

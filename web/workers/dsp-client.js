@@ -2,6 +2,7 @@
 //   const dsp = createDspClient();
 //   const spec = await dsp.stft(samples, opts, onProgress, {transfer: false});  // transfer=true detaches samples
 //   const ridge = await dsp.ridge(spec, seed, opts);   // copies spec (structured clone); main thread is fine too
+//   const {spec, whitened} = await dsp.refspec(samples, fs);   // scoring spectrogram + whitened Z, off the main thread
 //   dsp.terminate();
 export function createDspClient(url = new URL('./dsp.worker.js', import.meta.url)) {
   const worker = new Worker(url, { type: 'module' });
@@ -25,6 +26,12 @@ export function createDspClient(url = new URL('./dsp.worker.js', import.meta.url
       return call({ type: 'stft', samples: s, opts }, [s.buffer], onProgress);
     },
     ridge: (spec, seed, opts) => call({ type: 'ridge', spec, seed, opts }, []),
-    terminate: () => worker.terminate(),
+    /** -> {spec (reference dB spectrogram, geoloc.js#referenceSpectrogram), whitened (unit 'z', same grid)}; copies samples. */
+    refspec(samples, fs) { const s = samples.slice(); return call({ type: 'refspec', samples: s, fs }, [s.buffer]); },
+    terminate: () => {
+      worker.terminate();
+      for (const p of pending.values()) p.reject(new DOMException('DSP worker terminated', 'AbortError'));
+      pending.clear();
+    },
   };
 }

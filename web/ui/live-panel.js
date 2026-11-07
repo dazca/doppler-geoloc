@@ -1,21 +1,18 @@
 // "Record now" (live mode, E4): microphone recording with an exact start time, live discovery of nearby aircraft
 // through the ADS-B proxy, then trace backfill. Reuses Lane L's modules in web/live/.
 // The app supplies callbacks; this module only owns the live panel UI and the recording session.
-import { startRecording } from '../live/recorder.js';
+import { startRecording, wavFromBlocks } from '../live/recorder.js';
 import { startPolling, finishTracks } from '../live/session.js';
 import { LiveTrackBuilder, bboxAround } from '../live/adsb-live.js';
 
 export const LIVE_T_TOL_S = 3;   // Lane L: ADS-B stamp latency + audio anchor → ±3 s prior on T_start
+export const LIVE_MAX_S = 45 * 60;   // B2: auto-stop (memory and ADS-B backfill both grow with the length)
 
 /** 16-bit PCM mono WAV file from Float32 samples. */
 export function wavFile(samples, fs, name) {
-  const n = samples.length, buf = new ArrayBuffer(44 + 2 * n), v = new DataView(buf);
-  const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
-  str(0, 'RIFF'); v.setUint32(4, 36 + 2 * n, true); str(8, 'WAVE'); str(12, 'fmt ');
-  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, fs, true);
-  v.setUint32(28, fs * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); str(36, 'data'); v.setUint32(40, 2 * n, true);
-  for (let i = 0; i < n; i++) v.setInt16(44 + 2 * i, Math.max(-1, Math.min(1, samples[i])) * 32767, true);
-  return new File([buf], name, { type: 'audio/wav' });
+  const n = samples.length, pcm = new Int16Array(n);
+  for (let i = 0; i < n; i++) pcm[i] = Math.max(-1, Math.min(1, samples[i])) * 32767;
+  return wavFromBlocks([pcm], n, fs, name);
 }
 
 export function micUnavailableReason() {
@@ -97,6 +94,7 @@ export function createLivePanel(el, ctx) {
       show('recording');
       timer = setInterval(() => {
         const s = session?.rec.seconds ?? 0, tm = el.querySelector('#live-time'), st = el.querySelector('#live-stats');
+        if (s >= LIVE_MAX_S && session && !session.stopping) { ctx.toast(t('live.autostop', { min: Math.round(LIVE_MAX_S / 60) }), { ms: 8000 }); stop(); return; }
         if (tm) tm.textContent = `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
         const ps = session?.poll.stats;
         if (st && ps && ps.polls === 0 && ps.errors >= 2) {
@@ -114,7 +112,8 @@ export function createLivePanel(el, ctx) {
   }
 
   async function stop() {
-    if (!session) return;
+    if (!session || session.stopping) return;
+    session.stopping = true;
     clearInterval(timer);
     const { rec, poll, builder, region } = session;
     show('finishing', { text: t('live.saving') });
@@ -122,11 +121,12 @@ export function createLivePanel(el, ctx) {
     poll.stop();
     const clock = poll.clock.estimate();
     const tStartUnix = ((a.tStartLocalMs ?? (performance.timeOrigin + session.t0)) + (clock.offsetMs ?? 0)) / 1000;
-    const durationS = a.samples.length / a.fs;
+    const durationS = a.n / a.fs;
     session = null;
     if (durationS < 5) { show('setup'); ctx.toast(t('live.short'), { error: true }); return; }
     const iso = new Date(tStartUnix * 1000).toISOString().replace(/[:]/g, '-').replace(/\..+/, '');
-    const file = wavFile(a.samples, a.fs, `live_${iso}.wav`);
+    const file = wavFromBlocks(a.blocks, a.n, a.fs, `live_${iso}.wav`);
+    a.blocks = null;   // the File owns the PCM now: drop our copy before the backfill and the analysis
     const radiusM = Math.max(15000, region.radius_m || 0);
     show('finishing', { text: t('live.tracks'), frac: 0 });
     let ft;

@@ -15,6 +15,8 @@ export const ENGINE_INFO = mod.ENGINE_INFO || { name: wanted, version: '?', fake
 export const { fitEvent, fetchFlights, runSearch, simulateCurves } = mod;
 /** Optional (real engine only): reference spectrogram for scoring, (samples, fs) → contract spectrogram. */
 export const referenceSpectrogram = mod.referenceSpectrogram || null;
+/** Optional (real engine only): terminate the worker pool and per-recording caches (new file / new project). */
+export const releaseEngine = mod.releaseEngine || null;
 // [id, plain-language label, technical name (tooltip)]
 export const STAGES = [
   ['grid', 'Laying out places to test', 'search grid + terrain'], ['cpa', 'When each plane was closest', 'delayed closest approach (CPA)'],

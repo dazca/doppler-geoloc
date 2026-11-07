@@ -38,6 +38,39 @@ export function makeLUT(name) {
   return lut;
 }
 
+// B9: time-pooled max pyramid for redraws of long, zoomed-out spectrograms. Level k max-pools factor^k original time
+// rows (only levels of factor 8, 64, 512: ~14 % extra memory). maxRowsInto() takes the max over rows [i0, i1] using
+// the coarsest whole blocks inside the range and finer levels / raw rows at the edges, so the result is exact.
+export function buildTimePyramid(data, nT, nF, { factor = 8, maxLevels = 3 } = {}) {
+  const levels = [];
+  let src = data, n = nT, F = 1;
+  while (levels.length < maxLevels && n >= 2 * factor) {
+    const m = Math.ceil(n / factor), d = new Float32Array(m * nF);
+    for (let i = 0; i < m; i++) {
+      const o = i * nF, k0 = i * factor, k1 = Math.min(n, k0 + factor);
+      d.set(src.subarray(k0 * nF, k0 * nF + nF), o);
+      for (let k = k0 + 1; k < k1; k++) { const q = k * nF; for (let j = 0; j < nF; j++) { const v = src[q + j]; if (v > d[o + j]) d[o + j] = v; } }
+    }
+    F *= factor; levels.push({ F, n: m, data: d }); src = d; n = m;
+  }
+  return levels;
+}
+/** col[j] = max(col[j], max over original rows i0..i1 of data[i*nF + j]) for j in [jMin, jMax], using levels[0..li]. */
+export function maxRowsInto(col, jMin, jMax, data, nF, levels, i0, i1, li = levels.length - 1) {
+  if (i1 < i0) return;
+  while (li >= 0) {
+    const { F, data: d } = levels[li], b0 = Math.ceil(i0 / F), b1 = Math.floor((i1 + 1) / F) - 1;
+    if (b1 >= b0) {
+      maxRowsInto(col, jMin, jMax, data, nF, levels, i0, b0 * F - 1, li - 1);
+      for (let b = b0; b <= b1; b++) { const o = b * nF; for (let j = jMin; j <= jMax; j++) { const v = d[o + j]; if (v > col[j]) col[j] = v; } }
+      maxRowsInto(col, jMin, jMax, data, nF, levels, (b1 + 1) * F, i1, li - 1);
+      return;
+    }
+    li--;
+  }
+  for (let i = i0; i <= i1; i++) { const o = i * nF; for (let j = jMin; j <= jMax; j++) { const v = data[o + j]; if (v > col[j]) col[j] = v; } }
+}
+
 // indices of cells (centres x0 + i*dx) inside [a, b); nearest cell if none
 function cellRange(a, b, x0, dx) {
   let i0 = Math.ceil((a - x0) / dx - 1e-9), i1 = Math.ceil((b - x0) / dx - 1e-9) - 1;
@@ -89,7 +122,7 @@ export class SpectrogramView {
   _emit(ev, d) { for (const cb of this.handlers[ev] || []) cb(d); }
 
   setSpectrogram(spec, { keepView = false, autoLevels = true } = {}) {
-    this.spec = spec;
+    this.spec = spec; this._pyr = null;
     if (!keepView) this.resetView(false);
     if (autoLevels) this.autoLevels(); else this._invalidate();
   }
@@ -184,6 +217,13 @@ export class SpectrogramView {
     const gl = new Uint8Array(1024); // gamma LUT on normalised value
     for (let i = 0; i < 1024; i++) gl[i] = Math.round(255 * Math.pow(i / 1023, g));
     const bg = lut[0];
+    // zoomed out by >= 8 time cells per pixel column: use the pooled pyramid (built once per spectrogram)
+    const cellsPerPx = (v.t1 - v.t0) / s.dt / W;
+    let levels = [];
+    if (cellsPerPx >= 8) {
+      if (this._pyr?.spec !== s) this._pyr = { spec: s, levels: buildTimePyramid(data, nT, nF) };
+      levels = this._pyr.levels.filter((l) => l.F <= cellsPerPx);
+    }
     for (let x = 0; x < W; x++) {
       let [i0, i1] = cellRange(v.t0 + x / W * (v.t1 - v.t0), v.t0 + (x + 1) / W * (v.t1 - v.t0), s.t0, s.dt);
       if (i1 < 0 || i0 >= nT) { for (let y = 0; y < H; y++) px[y * W + x] = bg; continue; }
@@ -191,10 +231,7 @@ export class SpectrogramView {
       // max over time cells in this column
       const jMin = fLo[H - 1], jMax = fHi[0];
       for (let j = jMin; j <= jMax; j++) col[j] = -Infinity;
-      for (let i = i0; i <= i1; i++) {
-        const o = i * nF;
-        for (let j = jMin; j <= jMax; j++) { const val = data[o + j]; if (val > col[j]) col[j] = val; }
-      }
+      maxRowsInto(col, jMin, jMax, data, nF, levels, i0, i1);
       for (let y = 0; y < H; y++) {
         let m = -Infinity;
         for (let j = fLo[y]; j <= fHi[y]; j++) if (col[j] > m) m = col[j];

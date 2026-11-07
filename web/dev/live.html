@@ -40,7 +40,7 @@ ADS-B data © adsb.lol contributors, ODbL 1.0. Needs <code>?proxy=&lt;CORS proxy
 <pre id="log"></pre>
 
 <script type="module">
-import { startRecording } from '../live/recorder.js';
+import { startRecording, blocksToFloat32 } from '../live/recorder.js';
 import { startPolling, finishTracks, liveSearchInput } from '../live/session.js';
 import { LiveTrackBuilder } from '../live/adsb-live.js';
 import { wallNow } from '../live/clock.js';
@@ -75,6 +75,7 @@ $('rec').onclick = async () => {
 $('stop').onclick = async () => {
   $('stop').disabled = true;
   const a = await S.rec.stop();
+  a.samples = blocksToFloat32(a.blocks, a.n); a.blocks = null;
   S.poll.stop();
   const est = S.poll.clock.estimate();
   S.tStartUnix = (a.tStartLocalMs + (est.offsetMs ?? 0)) / 1000;

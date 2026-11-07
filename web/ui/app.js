@@ -2,7 +2,7 @@
 // "Locate" press (fetch flights + search) -> verdict and map. Every automatic decision stays editable.
 // Talks to the engine only through ./engine.js (contract: web/engine/geoloc-api.md). All strings: ./i18n.js.
 import * as Engine from './engine.js';
-import { createSpecPanel, stftOptions, ridgeOptions, PRESETS, DECODE_RATE } from './spec-panel.js';
+import { createSpecPanel, stftOptions, ridgeOptions, budgetHop, PRESETS, DECODE_RATE } from './spec-panel.js';
 import { createMapPanel, makeRegion, regionBBox, regionAreaKm2, regionPolygon, CAT_COLORS } from './map-panel.js';
 import { decodeAudioFile, readMediaMeta } from '../engine/audio.js';
 import * as T from './time-utils.js';
@@ -205,40 +205,66 @@ async function loadMedia(file, { demo = null, keepProject = false, forceRange = 
   }
   R.decoding = true;
   spec.setSource(null);
+  R.runAbort?.abort(); R.detectAbort?.abort();
   try {
     busy(t('busy.read', { name: file.name }), null);
     const meta = await readMediaMeta(file).catch(() => null);
     const estDur = meta?.durationSec || await probeDuration(file);
     let crop = (same || keepProject) && P.media?.crop ? P.media.crop : null;
-    if (forceRange || (!crop && isLarge(file.size, estDur))) {
+    const streamable = meta?.container === 'isobmff' || /\.wav$/i.test(file.name || '');
+    if (forceRange || (!crop && isLarge(file, estDur, streamable))) {
       busy(null);
-      const choice = await askLargeFile(file, estDur, crop);
+      const choice = await askLargeFile(file, estDur, crop, streamable);
       if (!choice) { renderMedia(); return; }
       crop = choice.crop;
     }
+    releaseMedia();                      // B4: the previous recording's buffers go before the new decode starts
     busy(t('busy.decode'), null);
     const t0 = performance.now();
-    const dec = await decodeAudioFile(file, { sampleRate: DECODE_RATE, readMeta: false });
+    let dec;
+    try {
+      dec = await decodeAudioFile(file, { sampleRate: DECODE_RATE, readMeta: false, crop, onProgress: (p) => busy(t('busy.decode'), p),
+        ...(QS.has('stream') ? { streamBytes: 0 } : {}) });
+    } catch (e) {
+      R.file = null; resetSpecUi();
+      throw new Error(audioErrorText(e, file) || e?.message || String(e));
+    }
     const decodeMs = performance.now() - t0;
     R.file = file;
-    if (crop) {
-      const a = Math.max(0, Math.floor(crop[0] * dec.sampleRate)), b = Math.min(dec.samples.length, Math.ceil(crop[1] * dec.sampleRate));
-      crop = [a / dec.sampleRate, b / dec.sampleRate];
-      R.samples = dec.samples.slice(a, b);
-    } else R.samples = dec.samples;
-    if (R.objUrl) URL.revokeObjectURL(R.objUrl);
+    crop = dec.crop;
+    R.samples = dec.samples;
     R.objUrl = URL.createObjectURL(file);
     spec.setSource(R.objUrl);
     P.media = { name: file.name, size: file.size, type: file.type || '', duration: dec.duration, sampleRate: dec.sampleRate,
       channels: dec.channels, creation: live ? { unix: live.tStartUnix, source: 'live' } : meta?.best || null,
-      containerDuration: meta?.durationSec ?? null, demo, decodeMs, crop, live };
+      containerDuration: meta?.durationSec ?? null, demo, decodeMs, crop, live, decodePath: dec.path };
     if (!P.time.start && P.media.creation && !live) setTimeFromCreation();
     if (!P.region && !demo) applyDefaultRegion();
     renderAll();
-    await computeSpec();
+    try { await computeSpec(); } catch (e) { if (e instanceof RangeError) throw new Error(t('audio.err.toolarge', { name: file.name, size: fmtBytes(file.size) })); throw e; }
     if (R.undo) toast(t('toast.newfile'), { action: { label: t('undo'), fn: undo } });
   } finally { R.decoding = false; busy(null); renderMedia(); renderFlow(); }
   if ($('opt-autodetect').checked && !P.events.length) await guard(autoDetect)();
+}
+
+/** B4: drop every per-recording buffer (samples, scoring spectrogram, worker copies, engine pool, object URL). */
+function releaseMedia() {
+  R.samples = null; R.refSpec = null;
+  spec.setSource(null); spec.clear();
+  if (R.objUrl) { URL.revokeObjectURL(R.objUrl); R.objUrl = null; }
+  Engine.releaseEngine?.();
+}
+function resetSpecUi() {
+  $('spec-status').textContent = '';
+  for (const id of ['btn-play', 'scrub', 'btn-recompute']) $(id).disabled = true;
+}
+/** Translated text for decodeAudioFile's coded errors (B1), or null. */
+function audioErrorText(e, file) {
+  const v = { name: file.name, size: fmtBytes(file.size) };
+  if (e?.code === 'too-large' || e instanceof RangeError) return t('audio.err.toolarge', v);
+  if (e?.code === 'undecodable') return t('audio.err.undecodable', v);
+  if (e?.code === 'bad-range') return t('audio.err.badrange', v);
+  return null;
 }
 
 function applyDefaultRegion() {
@@ -249,8 +275,12 @@ function applyDefaultRegion() {
 }
 
 // ------------------------------------------------------------------ large files
+// B6: offer a range when the estimated peak memory exceeds a quarter of the device memory (navigator.deviceMemory,
+// 2 GB when the browser does not say). ?largeMB= / ?largeMin= force the old size/duration thresholds (tests).
 const LARGE_BYTES = (+QS.get('largeMB') || 1024) * 1e6, LARGE_S = (+QS.get('largeMin') || 60) * 60;
-const isLarge = (bytes, dur) => bytes > LARGE_BYTES || (dur || 0) > LARGE_S;
+const memBudget = () => (navigator.deviceMemory ?? 2) * 1e9 * 0.25;
+const isLarge = (file, dur, streamable) => (QS.has('largeMB') || QS.has('largeMin') ? file.size > LARGE_BYTES || (dur || 0) > LARGE_S
+  : estimateMemory(dur || 0, null, { streamable, size: file.size }) > memBudget());
 function probeDuration(file) {
   return new Promise((resolve) => {
     const a = document.createElement('audio'), url = URL.createObjectURL(file);
@@ -263,26 +293,29 @@ function probeDuration(file) {
     a.src = url;
   });
 }
-function estimateMemory(dur, crop = null) {
-  const decode = dur * 48000 * 2 * 4 * 1.6;
-  const kept = crop ? crop[1] - crop[0] : dur;
-  return decode + kept * 8000 * 4 * 2 + (kept / 0.064) * 1009 * 4 * 3;
+/** Peak memory (bytes) to analyse [crop] of a recording of `dur` s: decode + samples + display and scoring spectrograms. */
+function estimateMemory(dur, crop = null, { streamable = true, size = 0 } = {}) {
+  const kept = crop ? Math.max(0, Math.min(dur || crop[1], crop[1]) - crop[0]) : dur;
+  const decode = streamable ? 16e6 : size + dur * 48000 * 2 * 4;   // streaming keeps only blocks; else file + decoded PCM
+  const p = PRESETS[P.spec.preset] || PRESETS.standard, nF = Math.floor(2000 * p.nfft / DECODE_RATE) - Math.ceil(30 * p.nfft / DECODE_RATE) + 1;
+  const display = (kept * DECODE_RATE / budgetHop(p, kept)) * nF * 4 * 2;       // main thread + track worker
+  const scoring = (kept * DECODE_RATE / 1024) * 513 * 4 * 3;                      // raw + whitened + worker copy
+  return decode + kept * DECODE_RATE * 4 * 2 + display + scoring;
 }
 const fmtBytes = (b) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.round(b / 1e6)} MB`);
-function parseClock(str) {
-  const m = /^\s*(\d+(?:\.\d+)?)(?::(\d+(?:\.\d+)?))?(?::(\d+(?:\.\d+)?))?\s*$/.exec(str || '');
-  if (!m) return null;
-  return [m[1], m[2], m[3]].filter((x) => x != null).map(Number).reduce((acc, x) => acc * 60 + x, 0);
-}
-function askLargeFile(file, dur, crop) {
+const { parseClock } = T;
+function askLargeFile(file, dur, crop, streamable) {
   return new Promise((resolve) => {
     const box = $('large-panel');
     const from = h('input', { id: 'crop-from', value: T.fmtAudio(crop?.[0] ?? 0, 0), 'aria-label': t('large.from'), spellcheck: 'false' });
     const to = h('input', { id: 'crop-to', value: T.fmtAudio(crop?.[1] ?? Math.min(dur || 1800, 1800), 0), 'aria-label': t('large.to'), spellcheck: 'false' });
-    const est = h('p', { class: 'meta-line' });
+    const est = h('p', { class: 'meta-line', 'aria-live': 'polite' });
+    const durTxt = dur ? T.fmtAudio(dur, 0) : '';
     const upd = () => {
-      const a = parseClock(from.value), b = parseClock(to.value);
-      est.textContent = a != null && b > a ? `${T.fmtDuration(b - a)} · ~${fmtBytes(estimateMemory(dur || b, [a, b]))}` : t('large.bad');
+      const a = parseClock(from.value), b = parseClock(to.value), err = T.cropRangeError(a, b, dur);
+      est.textContent = err ? t(err, { d: durTxt }) : `${T.fmtDuration(Math.min(b, dur || b) - a)} · ~${fmtBytes(estimateMemory(dur || b, [a, b], { streamable, size: file.size }))}`;
+      est.classList.toggle('is-error', !!err);
+      return err;
     };
     from.addEventListener('input', upd); to.addEventListener('input', upd);
     const finish = (v) => { box.hidden = true; box.replaceChildren(); resolve(v); };
@@ -294,8 +327,10 @@ function askLargeFile(file, dur, crop) {
       est,
       h('div', { class: 'btn-row' },
         h('button', { type: 'button', class: 'btn btn--primary', id: 'btn-crop', onclick: () => {
-          const a = parseClock(from.value), b = parseClock(to.value);
-          if (a == null || !(b > a)) { to.setAttribute('aria-invalid', 'true'); return; }
+          const a = parseClock(from.value), b = parseClock(to.value), err = upd();
+          from.toggleAttribute('aria-invalid', err === 'large.past' || err === 'large.bad');
+          to.toggleAttribute('aria-invalid', !!err);
+          if (err) { (err === 'large.past' ? from : to).focus(); return; }
           finish({ crop: [a, dur ? Math.min(b, dur) : b] });
         } }, t('large.range')),
         h('button', { type: 'button', class: 'btn', id: 'btn-crop-all', onclick: () => finish({ crop: null }) }, t('large.all')),
@@ -447,7 +482,7 @@ async function autoDetect() {
   try {
     const found = await detectPasses(spec.spec, { cls: P.defaultCls, c: soundSpeed(), impulse: !!P.spec.impulse,
       exclude: P.events.filter((e) => Number.isFinite(e.t_cpa_audio)).map((e) => ({ t_cpa_audio: e.t_cpa_audio })) },
-    { signal: ac.signal, onProgress: (p) => { R.detectFrac = p?.frac; } });
+    { signal: ac.signal, onProgress: (p) => { R.detectFrac = p?.frac; }, run: spec.detect });
     for (const d of found || []) {
       if (!d?.fit || !d.points?.length) continue;
       const ev = newEvent(d.seed);
@@ -740,14 +775,20 @@ async function locate() {
   }
 }
 
+/** Reference spectrogram (and its whitened copy) for scoring, computed once per recording in the DSP worker (B11). */
 async function scoringSpectrogram() {
-  if (!Engine.referenceSpectrogram || !R.samples) return spec.spec;
+  if (!Engine.referenceSpectrogram || !R.samples) return { spec: spec.spec, whitened: null };
   if (R.refSpec?.samples !== R.samples) {
-    const z = await Engine.referenceSpectrogram(R.samples, DECODE_RATE);
-    if (P.media?.crop?.[0]) z.t0 += P.media.crop[0];
-    R.refSpec = { samples: R.samples, spec: z };
+    const samples = R.samples;
+    let z, w = null;
+    try { ({ spec: z, whitened: w } = await spec.reference(samples, DECODE_RATE)); }
+    catch (e) { if (e?.name === 'AbortError') throw e; z = await Engine.referenceSpectrogram(samples, DECODE_RATE); }
+    if (samples !== R.samples) throw new DOMException('Recording changed', 'AbortError');
+    const off = P.media?.crop?.[0] || 0;
+    if (off) { z.t0 += off; if (w) w.t0 += off; }
+    R.refSpec = { samples, spec: z, whitened: w };
   }
-  return R.refSpec.spec;
+  return R.refSpec;
 }
 function currentTerrain() {
   const x = P.run.settings.terrain || 'auto';
@@ -764,7 +805,7 @@ async function doRun(ac, progress) {
     silences: P.silences.map(({ t0, t1 }) => ({ t0, t1 })),
     region: { shape: P.region.shape, center: P.region.center, radius_m: P.region.shape === 'circle' ? P.region.radius_m : undefined, bbox: regionBBox(P.region) },
     time: timeWindow(), duration_s: P.media?.duration || 0,
-    tracks: usableTracks(), spec: await scoringSpectrogram(),
+    tracks: usableTracks(), ...await scoringSpectrogram().then((r) => ({ spec: r.spec, ...(r.whitened ? { whitened: r.whitened } : {}) })),
     settings: { grid_m: P.run.settings.grid_m, c: soundSpeed(), topN: P.run.settings.topN, offsetTolS: P.run.settings.offsetTolS, refine: true,
       mode: P.run.settings.mode || 'robust', keepGroundOps: evs.some((e) => isGroundOps(e) && e.useGround),
       ...(montageOn() && P.montage.chrono && clipSpans().length > 1 ? { config: { montage_chrono: true } } : {}) },
@@ -1208,9 +1249,8 @@ function wire() {
     closeMenu();
     R.undo = structuredClone(P);
     R.detectAbort?.abort(); R.runAbort?.abort(); R.fetchAbort?.abort();
-    P = freshProject(); clearRunErrors(); R.tracks = []; R.sim = null; R.samples = null; R.selEvent = null;
-    spec.clear(); spec.setSource(null); $('spec-status').textContent = '';
-    for (const id of ['btn-play', 'scrub', 'btn-recompute']) $(id).disabled = true;
+    P = freshProject(); clearRunErrors(); R.tracks = []; R.sim = null; R.selEvent = null; R.file = null;
+    releaseMedia(); resetSpecUi();
     banner(null); renderAll(); commit();
     if (COV?.bbox) mapPanel.map.fitBounds([[COV.bbox[0], COV.bbox[1]], [COV.bbox[2], COV.bbox[3]]]);
     toast(t('toast.new'), { action: { label: t('undo'), fn: undo } });
@@ -1387,7 +1427,7 @@ async function importProject(file) {
   R.undo = structuredClone(P);
   const keepMedia = R.samples && obj.media && obj.media.name === P.media?.name && obj.media.size === P.media?.size;
   P = obj; R.tracks = []; R.sim = null; R.selEvent = null; clearRunErrors();
-  if (!keepMedia) { R.samples = null; spec.clear(); spec.setSource(null); $('spec-status').textContent = ''; for (const id of ['btn-play', 'scrub', 'btn-recompute']) $(id).disabled = true; }
+  if (!keepMedia) { R.file = null; releaseMedia(); resetSpecUi(); }
   renderAll(); mapPanel.setRegion(P.region, { fit: !!P.region }); commit(); restoreTracks();
   toast(t('toast.opened', { name: file.name }), { action: { label: t('undo'), fn: undo } });
 }
