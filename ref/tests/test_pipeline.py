@@ -7,6 +7,7 @@ import http.server
 import io
 import json
 import os
+import re
 import sys
 import tarfile
 import threading
@@ -304,8 +305,9 @@ def test_worker_has_raises_on_429_and_5xx(monkeypatch):
 def test_day_done_partial_recent_is_rebuilt(monkeypatch):
     today = dt.date(2026, 11, 7)
     monkeypatch.setattr(dj.requests, "get", _fake_get(lambda u: {"status": "partial"} if "prod" in u else {}))
+    monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
     assert dj.day_done("https://w", dt.date(2026, 11, 5), today) is False
-    assert dj.day_done("https://w", dt.date(2026, 10, 1), today) is True
+    assert dj.day_done("https://w", dt.date(2026, 10, 1), today) == "partial"
 
 
 def test_unreachable_worker_skips_day(monkeypatch, capsys):
@@ -341,7 +343,7 @@ def test_rebuild_manifest_keeps_old_days_and_probes_few(monkeypatch):
     r2 = _FakeR2({dj.MANIFEST_KEY: {"days": old}}).install(monkeypatch)
     probed = []
 
-    def listed(worker, d, tries=8):
+    def listed(worker, d, tries=8, bucket=None, r2=None):
         probed.append(d)
         if d == dt.date(2026, 10, 20):
             raise dj.WorkerUnavailable("HTTP 503")  # in the manifest + unknown now -> kept
@@ -356,13 +358,13 @@ def test_rebuild_manifest_keeps_old_days_and_probes_few(monkeypatch):
     assert "2026-10-20" in days and "2026-10-21" not in days
     assert {"2026-11-01", "2026-11-06"} <= days                    # new days added
     # probed: Aug (not in manifest, 31 d) + the last 35 days; not the 25 older September/October manifest days
-    assert len(probed) == 31 + 36
+    assert len(probed) == 31 + 36 + 1  # + the R2 confirmation of the one removal
     assert r2.puts == 1
 
 
 def test_rebuild_manifest_refuses_big_shrink(monkeypatch):
     _FakeR2({dj.MANIFEST_KEY: {"days": _days("2026-10-01", 30)}}).install(monkeypatch)
-    monkeypatch.setattr(dj, "day_listed", lambda w, d, tries=8: False)
+    monkeypatch.setattr(dj, "day_listed", lambda w, d, tries=8, bucket=None, r2=None: False)
     with pytest.raises(RuntimeError, match="refusing"):
         dj.rebuild_manifest("https://w", "b", dt.date(2026, 10, 1), dt.date(2026, 10, 30), lambda *a: None,
                             recheck_days=40)
@@ -442,8 +444,9 @@ def test_r2_api_put_get_delete(mock_cf, monkeypatch, tmp_path):
     monkeypatch.setattr(dj, "WORK", str(tmp_path))
     assert dj.r2_selftest("bucket", lambda *a: None)
     m, path, auth, ctype = mock_cf.log[0]
-    assert (m, path, auth, ctype) == ("PUT", "/client/v4/accounts/acc/r2/buckets/bucket/objects/meta/_ci_probe.json",
-                                      "Bearer test-token", "application/json")
+    assert (m, auth, ctype) == ("PUT", "Bearer test-token", "application/json")
+    assert re.fullmatch(r"/client/v4/accounts/acc/r2/buckets/bucket/objects/meta/_ci_probe\.[0-9a-f]{12}\.json", path)
+    assert not _R2Handler.store  # probe deleted
     assert dj.r2_get_json("bucket", "nope.json") is None
 
 
@@ -493,3 +496,63 @@ def test_max_time_stops_cleanly(monkeypatch, capsys):
     assert dj.main(["--days", "3", "--max-time", "5", "--no-upload"]) == 0
     out = capsys.readouterr().out
     assert "REMAINING (3):" in out
+
+
+# ----------------------------------------------------------------- review round 2: F2/F3/F4/F10
+def test_r2_put_raises_on_404_bucket_missing(mock_cf, monkeypatch, tmp_path):
+    def put404(self):
+        self._auth()
+        self._send(404, b'{"success":false,"errors":[{"code":10006,"message":"bucket does not exist"}]}')
+    monkeypatch.setattr(_R2Handler, "do_PUT", put404)
+    p = tmp_path / "x.json"
+    p.write_text("{}")
+    with pytest.raises(RuntimeError, match="HTTP 404"):
+        dj.r2_put("nobucket", "x.json", str(p))
+    monkeypatch.setattr(dj, "WORK", str(tmp_path))
+    monkeypatch.setattr(dj, "_backoff", lambda attempt: None)
+    assert dj.main(["--r2-selftest", "--bucket", "nobucket"]) != 0
+
+
+def test_day_done_reads_r2_not_worker_with_token(mock_cf, monkeypatch):
+    monkeypatch.setattr(dj.requests, "get", lambda *a, **k: pytest.fail("must not ask the cached Worker"))
+    day = dt.date(2026, 10, 1)
+    assert dj.day_done("https://w", day, dt.date(2026, 11, 7), bucket="b") is False
+    for feed in ("prod", "mlatonly"):
+        _R2Handler.store[f"{fa.tag_for(day, feed)}/day.json"] = b'{"status":"ok"}'
+    assert dj.day_done("https://w", day, dt.date(2026, 11, 7), bucket="b") == "ok"
+    assert dj.day_listed("https://w", day, bucket="b") is True
+
+
+def test_rebuild_manifest_removal_needs_r2_confirmation(monkeypatch):
+    monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
+    day = dt.date(2026, 11, 1)
+    docs = {dj.MANIFEST_KEY: {"days": [str(day)]}}
+    for feed in ("prod", "mlatonly"):
+        docs[f"{fa.tag_for(day, feed)}/day.json"] = {"status": "ok"}
+    r2 = _FakeR2(docs).install(monkeypatch)
+    monkeypatch.setattr(dj, "worker_json", lambda w, k, tries=3: None)  # stale cached 404 from the Worker
+    monkeypatch.setattr(dj.time, "sleep", lambda s: None)
+    doc = dj.rebuild_manifest("https://w", "b", day, day, lambda *a: None)
+    assert doc["days"] == [str(day)] and r2.puts == 0
+
+
+def test_already_served_days_are_added_to_manifest(monkeypatch):
+    r2 = _FakeR2({dj.MANIFEST_KEY: {"days": []}}).install(monkeypatch)
+    monkeypatch.setattr(dj.time, "sleep", lambda s: None)
+    monkeypatch.setattr(dj, "day_done", lambda w, d, *a: "missing" if d == dt.date(2026, 11, 2) else "ok")
+    assert dj.main(["--date", "2026-11-01", "--date", "2026-11-02", "--date", "2026-11-03"]) == 0
+    assert r2.docs[dj.MANIFEST_KEY]["days"] == ["2026-11-01", "2026-11-03"]
+
+
+def test_max_time_margin(monkeypatch, capsys):
+    """--max-time uses 1.3 x the slowest day: 100 min left, slowest 80 min -> 104 min estimate -> stop."""
+    t = [0.0]
+    monkeypatch.setattr(dj.time, "time", lambda: t[0])
+    monkeypatch.setattr(dj, "day_done", lambda *a: False)
+
+    def build(*a):
+        t[0] += 80 * 60
+        return [], {"prod_status": "ok"}
+    monkeypatch.setattr(dj, "build_day", build)
+    assert dj.main(["--days", "3", "--max-time", "180", "--no-upload"]) == 0
+    assert "REMAINING (2):" in capsys.readouterr().out

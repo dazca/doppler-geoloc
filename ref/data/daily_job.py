@@ -156,23 +156,42 @@ def worker_has(worker, key, tries=3):
     return worker_json(worker, key, tries) is not None
 
 
-def day_done(worker, day, today=None, tries=3):
-    """True if both day.json are served (and prod is not a recent 'partial'). Raises WorkerUnavailable."""
+def day_json(worker, bucket, day, feed, tries=3, r2=None):
+    """<tag>/day.json of the day/feed: parsed dict, or None if absent.  Read straight from R2 when an API token is
+    set (r2=None) or r2=True, else via the Worker (cached up to 5 min for a 404, a day for a hit, so it can be stale).
+    Raises WorkerUnavailable if the answer is unknown (AuthError passes through)."""
+    key = f"{fa.tag_for(day, feed)}/day.json"
+    if _use_api() if r2 is None else r2:
+        try:
+            doc = r2_get_json(bucket, key)
+        except AuthError:
+            raise
+        except Exception as e:
+            raise WorkerUnavailable(f"cannot read {key} from R2 ({type(e).__name__}: {e})") from e
+        return doc if doc is None or isinstance(doc, dict) else {}
+    return worker_json(worker, key, tries)
+
+
+def day_done(worker, day, today=None, tries=3, bucket=BUCKET):
+    """The prod status ("ok"/"partial"/"empty"/"missing", truthy) if both day.json exist (and prod is not a recent
+    'partial'); False otherwise. Raises WorkerUnavailable."""
     today = today or dt.datetime.now(dt.timezone.utc).date()
-    prod = worker_json(worker, f"{fa.tag_for(day, 'prod')}/day.json", tries)
+    prod = day_json(worker, bucket, day, "prod", tries)
     if prod is None:
         return False
     if prod.get("status") == "partial" and day >= today - dt.timedelta(days=PARTIAL_RECHECK_DAYS):
         return False
-    return worker_json(worker, f"{fa.tag_for(day, 'mlatonly')}/day.json", tries) is not None
+    if day_json(worker, bucket, day, "mlatonly", tries) is None:
+        return False
+    return prod.get("status") or "unknown"
 
 
-def day_listed(worker, day, tries=8):
-    """Manifest membership: True if both day.json are served and prod has data; False if not; raises if unknown."""
-    prod = worker_json(worker, f"{fa.tag_for(day, 'prod')}/day.json", tries)
+def day_listed(worker, day, tries=8, bucket=BUCKET, r2=None):
+    """Manifest membership: True if both day.json exist and prod has data; False if not; raises if unknown."""
+    prod = day_json(worker, bucket, day, "prod", tries, r2)
     if prod is None or prod.get("status") == "missing":
         return False
-    return worker_json(worker, f"{fa.tag_for(day, 'mlatonly')}/day.json", tries) is not None
+    return day_json(worker, bucket, day, "mlatonly", tries, r2) is not None
 
 
 # ----------------------------------------------------------------- R2 access
@@ -260,7 +279,9 @@ def r2_put(bucket, key, path):
     if _use_api():
         with open(path, "rb") as f:
             body = f.read()
-        _api("PUT", bucket, key, data=body, headers={"Content-Type": _ctype(key)})
+        r = _api("PUT", bucket, key, data=body, headers={"Content-Type": _ctype(key)})
+        if not 200 <= r.status_code < 300:  # 404 = bucket missing: never a silent "uploaded"
+            raise RuntimeError(f"upload {key}: HTTP {r.status_code} (bucket {bucket!r} missing?): {r.text[:300]}")
         return
     if _wrangler(["put", f"{bucket}/{key}", "--file", path, "--content-type", _ctype(key)], 9) is None:
         raise RuntimeError(f"upload {key}: bucket does not exist")
@@ -349,7 +370,12 @@ def rebuild_manifest(worker, bucket, since, until, log, par=4, recheck_days=RECH
 
     def check(d):
         try:
-            return day_listed(worker, d)
+            ok = day_listed(worker, d, 8, bucket)
+            if ok is False and str(d) in known and not _use_api():
+                ok = day_listed(worker, d, 8, bucket, True)  # a removal must be confirmed by R2, not a cached 404
+            return ok
+        except AuthError:
+            raise
         except Exception as e:
             log(f"  {d}: probe failed ({e}); keeping previous state")
             return None
@@ -446,8 +472,10 @@ def build_day(day, a, log):
 
 
 # ----------------------------------------------------------------- main
-def r2_selftest(bucket, log, key="meta/_ci_probe.json"):
-    """PUT + GET + DELETE of a harmless key: proves the credentials before a long run."""
+def r2_selftest(bucket, log, key=None):
+    """PUT + GET + DELETE of a harmless key: proves the credentials before a long run.  The key is unique per call:
+    parallel backfill jobs run this at the same time and must not delete each other's probe."""
+    key = key or f"meta/_ci_probe.{random.getrandbits(48):012x}.json"
     os.makedirs(WORK, exist_ok=True)
     p = os.path.join(WORK, f"probe.{os.getpid()}.json")
     body = {"probe": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}
@@ -458,6 +486,11 @@ def r2_selftest(bucket, log, key="meta/_ci_probe.json"):
         back = r2_get_json(bucket, key)
         r2_delete(bucket, key)
         gone = r2_get_json(bucket, key) is None
+    except AuthError:
+        raise
+    except Exception as e:  # e.g. bucket missing (404)
+        log(f"R2 self-test FAILED: {type(e).__name__}: {e}")
+        return False
     finally:
         os.remove(p)
     ok = back == body and gone
@@ -486,7 +519,7 @@ def main(argv=None):
     ap.add_argument("--rebuild-manifest", action="store_true",
                     help=f"only merge the days the Worker serves into {MANIFEST_KEY} (see rebuild_manifest), then exit")
     ap.add_argument("--since", default=MANIFEST_SINCE, help="first day --rebuild-manifest looks for unknown days")
-    ap.add_argument("--r2-selftest", action="store_true", help="PUT/GET/DELETE meta/_ci_probe.json, then exit")
+    ap.add_argument("--r2-selftest", action="store_true", help="PUT/GET/DELETE a meta/_ci_probe.<random>.json key, then exit")
     a = ap.parse_args(argv)
     os.environ.setdefault("CLOUDFLARE_ACCOUNT_ID", "a1cd2a86a35ae7d3f0d9ec23c95ac31e")
     log = lambda *x: print(*x, flush=True)  # noqa: E731
@@ -514,10 +547,10 @@ def main(argv=None):
 def run_days(a, log, today, t_job):
     days = ([dt.date.fromisoformat(x) for x in a.date] if a.date
             else [today - dt.timedelta(days=k) for k in range(1, a.days + 1)])
-    built, failed, unsure, durations = 0, [], [], []
+    built, failed, unsure, durations, served = 0, [], [], [], []
     for i, day in enumerate(days):
         if a.max_time:
-            est = max(durations) if durations else DEFAULT_DAY_MIN * 60
+            est = 1.3 * max(durations) if durations else DEFAULT_DAY_MIN * 60  # margin: days vary in size
             left = a.max_time * 60 - (time.time() - t_job)
             if est > left:
                 rest = [str(d) for d in days[i:]]
@@ -526,8 +559,11 @@ def run_days(a, log, today, t_job):
                 break
         if not a.force:
             try:
-                if day_done(a.worker, day, today):
+                st = day_done(a.worker, day, today, 3, a.bucket)
+                if st:
                     log(f"{day}: already served, skip")
+                    if st != "missing":
+                        served.append(str(day))  # (re)asserted in the manifest at the end
                     continue
             except WorkerUnavailable as e:
                 unsure.append(str(day))
@@ -570,6 +606,13 @@ def run_days(a, log, today, t_job):
                     p = os.path.join(a.cache, f"{fa.tag_for(day, feed)}.idx.json.gz")
                     if os.path.exists(p):
                         os.remove(p)
+    if served and not a.no_upload:
+        try:
+            manifest_update(a.bucket, log, add=served)
+        except AuthError:
+            raise
+        except Exception as e:  # the next --rebuild-manifest lists them
+            log(f"manifest update for {len(served)} already-served day(s) failed ({type(e).__name__}: {e})")
     log(f"done: {built} day(s) built" + (f", FAILED: {', '.join(failed)}" if failed else "")
         + (f", Worker unsure (skipped): {', '.join(unsure)}" if unsure else ""))
     return 1 if failed else 0

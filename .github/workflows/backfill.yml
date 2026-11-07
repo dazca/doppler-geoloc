@@ -67,6 +67,13 @@ jobs:
       - name: Install pinned, hash-locked wheels
         timeout-minutes: 10
         run: 'pip install --require-hashes --only-binary=:all: --no-deps -r ref/data/requirements-ci.txt'
+      # fail in seconds (not after hours of streaming) if the token, account or bucket is wrong
+      - name: R2 self-test (PUT/GET/DELETE a probe key)
+        timeout-minutes: 5
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.CLOUDFARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: a1cd2a86a35ae7d3f0d9ec23c95ac31e
+        run: python ref/data/daily_job.py --r2-selftest
       - name: Build + upload this slice
         timeout-minutes: 340
         env:
@@ -101,4 +108,8 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.CLOUDFARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: a1cd2a86a35ae7d3f0d9ec23c95ac31e
           GITHUB_TOKEN: ${{ github.token }}  # read-only (permissions above); GitHub API rate limit
-        run: python ref/data/daily_job.py --rebuild-manifest
+          FROM: ${{ inputs.from }}
+        run: |
+          # probe the whole backfilled range for days missing from the manifest (default --since is later)
+          [[ "$FROM" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "bad from: $FROM"; exit 1; }
+          python ref/data/daily_job.py --rebuild-manifest --since "$FROM"
