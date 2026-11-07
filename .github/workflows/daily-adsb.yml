@@ -4,7 +4,12 @@ name: daily-adsb-data
 on:
   schedule:
     - cron: "30 6 * * *"   # 06:30 UTC: adsb.lol publishes day D on D+1 between ~00:20 and 03:30 UTC
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Build only this UTC day (YYYY-MM-DD); empty = catch-up of the last 30 days"
+        required: false
+        default: ""
 concurrency: { group: daily-adsb-data, cancel-in-progress: false }
 jobs:
   build:
@@ -29,4 +34,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: a1cd2a86a35ae7d3f0d9ec23c95ac31e
           PROJ_NETWORK: "ON"
-        run: python ref/data/daily_job.py --days 30 --max-days 5
+          ONE_DATE: ${{ inputs.date }}
+        run: |
+          if [ -n "$ONE_DATE" ]; then python ref/data/daily_job.py --date "$ONE_DATE"
+          else python ref/data/daily_job.py --days 30 --max-days 5; fi
