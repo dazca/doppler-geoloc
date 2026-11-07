@@ -512,6 +512,7 @@ class _R2Handler(http.server.BaseHTTPRequestHandler):
         type(self).log.append((self.command, self.path, self.headers.get("Authorization"),
                                self.headers.get("Content-Type")))
         if type(self).deny:
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))  # else Windows may reset -> client retry
             self._send(403, b'{"success":false,"errors":[{"code":10000,"message":"Authentication error"}]}')
             return False
         return True
