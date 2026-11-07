@@ -179,6 +179,12 @@ test('handler: R2 404 is cached 300 s (one R2 read); coverage 404 stays <= 60 s;
   assert.equal(ok.headers.get('X-Source'), 'adsb.lol');
   assert.match(ok.headers.get('Access-Control-Expose-Headers'), /Link, X-Source/);
   assert.ok(store.has('https://cache.internal/adsb/tile/2026-11-02/263364.json'));
+  // a stored copy whose Cache-Control was rewritten by the zone (Browser Cache TTL) and that predates the ODbL headers
+  store.set('https://cache.internal/adsb/index/meta/coverage.json', new Response('{}', { headers: { 'Cache-Control': 'public, max-age=14400' } }));
+  const cov = await go('/adsb/index/meta/coverage.json');
+  assert.deepEqual([cov.headers.get('X-Cache'), cov.headers.get('Cache-Control'), cov.headers.get('X-Source')], ['HIT', 'public, max-age=60', 'adsb.lol']);
+  store.set('https://cache.internal/adsb/tile/2026-11-03/263364.json', new Response('x', { status: 404, headers: { 'Cache-Control': 'public, max-age=14400' } }));
+  assert.equal((await go('/adsb/tile/2026-11-03/263364.json')).headers.get('Cache-Control'), 'public, max-age=300');
 });
 
 test('handler: upstream errors on non-R2 routes are still not cached', async () => {

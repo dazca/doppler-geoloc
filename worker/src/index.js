@@ -66,16 +66,24 @@ async function range(r) {
 
 const ODBL = { Link: '<https://opendatacommons.org/licenses/odbl/1-0/>; rel="license"', 'X-Source': 'adsb.lol' };
 const R2_MISS_TTL = 300; // s; a day is built once a day, so a short negative cache is safe (coverage stays <= its 60 s)
+const isR2 = (r) => r.route === 'tile' || r.route === 'index';
+
+/** The route's own Cache-Control. Re-applied on cache hits: the zone's Browser Cache TTL (4 h) rewrites the stored copy. */
+function cacheControl(r, status) {
+  if (r.route === 'range') return 'public, max-age=31536000, immutable';
+  if (isR2(r)) return `public, max-age=${status === 404 ? Math.min(R2_MISS_TTL, r.ttl || R2_MISS_TTL) : r.ttl || 86400}`;
+  return `public, max-age=${r.ttl}`;
+}
 
 async function r2(env, r) {
   if (!env.INDEX) return new Response(JSON.stringify({ error: 'index bucket not configured' }), { status: 501 });
   const obj = await env.INDEX.get(r.r2key);
   if (!obj) return new Response(JSON.stringify({ error: `no ${r.route} for this day/cell (not built yet)` }), { status: 404,
-    headers: { 'Content-Type': 'application/json', 'Cache-Control': `public, max-age=${Math.min(R2_MISS_TTL, r.ttl || R2_MISS_TTL)}` } });
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': cacheControl(r, 404) } });
   // Tiles are stored gzipped. They are cached as opaque bytes (X-Body-Gzip) and only labelled Content-Encoding: gzip
   // when served, so the Cache API never re-encodes or decodes them.
   const h = { 'Content-Type': r.route === 'tile' ? 'application/octet-stream' : 'application/json',
-    'Cache-Control': `public, max-age=${r.ttl || 86400}`, ...ODBL };
+    'Cache-Control': cacheControl(r, 200), ...ODBL };
   if (r.route === 'tile') h['X-Body-Gzip'] = '1';
   return new Response(await obj.arrayBuffer(), { headers: h });
 }
@@ -100,7 +108,7 @@ export async function handle(req, env = {}, ctx = undefined, limiter = buckets) 
   const lim = await checkLimit(env, limiter, r.route, ip);
   if (!lim.ok) return err(req, env, 429, 'rate limited, slow down', { 'Retry-After': String(lim.retryAfterS) });
 
-  const produce = r.route === 'range' ? () => range(r) : (r.route === 'tile' || r.route === 'index') ? () => r2(env, r) : () => live(r);
+  const produce = r.route === 'range' ? () => range(r) : isR2(r) ? () => r2(env, r) : () => live(r);
   let res, hit;
   try {
     ({ res, hit } = await cached(ctx, r.key, produce));
@@ -110,6 +118,8 @@ export async function handle(req, env = {}, ctx = undefined, limiter = buckets) 
   }
   const h = cors(req, env, new Headers(res.headers));
   h.set('X-Cache', hit ? 'HIT' : 'MISS');
+  if (hit && (res.ok || res.status === 404)) h.set('Cache-Control', cacheControl(r, res.status));
+  if (isR2(r) && res.ok) for (const [k, v] of Object.entries(ODBL)) h.set(k, v); // also on entries cached before this header
   const gz = h.get('X-Body-Gzip') === '1';
   if (gz) { h.delete('X-Body-Gzip'); h.set('Content-Type', 'application/json'); h.set('Content-Encoding', 'gzip'); }
   if (r.route === 'point' || r.route === 'trace') {
