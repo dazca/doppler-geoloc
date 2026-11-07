@@ -387,8 +387,10 @@ export function parseAudioTrack(u8, fileSize = Infinity) {
   for (const trak of top.filter((b) => b.type === 'trak')) {
     const mdia = kid(trak, 'mdia'), hdlr = kid(mdia, 'hdlr');
     if (!hdlr || fourcc(u8, hdlr.body + 8) !== 'soun') continue;
-    const mdhd = kid(mdia, 'mdhd'), v1 = u8[mdhd.body] === 1;
-    if (!mdhd) continue;
+    const mdhd = kid(mdia, 'mdhd');
+    if (!mdhd || mdhd.end - mdhd.body < 24) continue;
+    const v1 = u8[mdhd.body] === 1;
+    if (v1 && mdhd.end - mdhd.body < 32) continue;
     const timescale = dv.getUint32(mdhd.body + (v1 ? 20 : 12)), duration = v1 ? u64(dv, mdhd.body + 24) : dv.getUint32(mdhd.body + 16);
     const stbl = kid(kid(mdia, 'minf'), 'stbl'), stsd = kid(stbl, 'stsd');
     if (!stsd || stsd.end - stsd.body < 16) continue;

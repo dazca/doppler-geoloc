@@ -497,6 +497,8 @@ def _process_batch(batch):
     for off, data in batch:
         try:
             d = json.loads(gzip.decompress(data) if data[:2] == b"\x1f\x8b" else data)
+        except MemoryError:  # our RAM, not upstream corruption: fail the batch so the day is retried
+            raise
         except Exception:  # noqa: BLE001 - zlib.error / EOFError / bad JSON: counted, not fatal
             out.append((off, len(data), None, None, None))
             continue
@@ -913,6 +915,7 @@ def corruption_status(st, n_traces, n_corrupt=0, skipped_bytes=0, size_bytes=0, 
     st["note"] = f"{st['note']}; {msg}" if st.get("note") else msg
     if st.get("status") == "ok" and (lost > PARTIAL_LOSS or resync_failed):
         st["status"] = "partial"
+        st["partial_reason"] = "corrupt"   # immutable upstream defect: rebuilding cannot improve it"
     return st
 
 
@@ -1069,6 +1072,7 @@ def fetch(bbox, t0, t1, feeds=("prod", "mlatonly"), cache=DEFAULT_CACHE, max_alt
             tag = tag_for(day, feed)
             p = os.path.join(cache, f"{tag}.idx.json.gz")
             miss = os.path.join(cache, f"{tag}.missing")
+            corr = None
             try:
                 if os.path.exists(miss):
                     with open(miss, encoding="utf-8") as f:
@@ -1081,8 +1085,11 @@ def fetch(bbox, t0, t1, feeds=("prod", "mlatonly"), cache=DEFAULT_CACHE, max_alt
                         idx = json.load(f)
                     per_feed.append(index_day(s, idx, bbox, t0, t1, max_alt_ft, log, keep_ground))
                     n, size = len(idx["traces"]), sum(sz for _, sz in idx["parts"])
+                    corr = (idx.get("n_corrupt", 0), idx.get("tar_skipped_bytes", 0), idx.get("tar_resync_failed", False))
                     del idx
                 st = day_status(day, feed, n, size, cache)
+                if corr:
+                    st = corruption_status(st, n, corr[0], corr[1], size, corr[2])
             except MissingRelease as e:
                 old = day < dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=2)
                 if old and not os.path.exists(miss) and not isinstance(e, IncompleteRelease):  # don't ask again

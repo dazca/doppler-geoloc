@@ -89,6 +89,8 @@ def region_batch(batch):
     for off, data in batch:
         try:
             d = json.loads(gzip.decompress(data) if data[:2] == b"\x1f\x8b" else data)
+        except MemoryError:  # our RAM, not upstream corruption: fail the batch so the day is retried
+            raise
         except Exception:  # noqa: BLE001 - corrupt upstream member (zlib.error, EOFError, bad JSON): counted
             out.append((off, len(data), None, None, None))
             continue
@@ -179,7 +181,8 @@ def day_done(worker, day, today=None, tries=3, bucket=BUCKET):
     prod = day_json(worker, bucket, day, "prod", tries)
     if prod is None:
         return False
-    if prod.get("status") == "partial" and day >= today - dt.timedelta(days=PARTIAL_RECHECK_DAYS):
+    if (prod.get("status") == "partial" and prod.get("partial_reason") != "corrupt"
+            and day >= today - dt.timedelta(days=PARTIAL_RECHECK_DAYS)):
         return False
     if day_json(worker, bucket, day, "mlatonly", tries) is None:
         return False

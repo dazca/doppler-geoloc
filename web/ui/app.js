@@ -230,7 +230,8 @@ async function loadMedia(file, { demo = null, keepProject = false, forceRange = 
         ...(QS.has('stream') ? { streamBytes: 0 } : {}) });
     } catch (e) {
       // the previous recording is already released: show the empty state rather than its stale name/duration
-      R.file = null; P.media = null; resetSpecUi();
+      // keep the media record (name, crop, duration) when the project's events still refer to it: reattach state
+      R.file = null; if (!keepProject && !same) P.media = null; resetSpecUi();
       throw new Error(audioErrorText(e, file) || e?.message || String(e));
     }
     const decodeMs = performance.now() - t0;
