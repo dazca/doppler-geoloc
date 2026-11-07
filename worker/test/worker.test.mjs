@@ -112,3 +112,17 @@ test('handler: per-IP 429 with Retry-After on the live route', async () => {
   assert.ok(Number(r.headers.get('Retry-After')) >= 1);
   assert.equal((await go('2.2.2.2')).status, 200);
 });
+
+test('coverage manifest: own route, read from R2 meta/coverage.json, short cache TTL; other meta/* keys rejected', async () => {
+  const r = parseRoute(U('/adsb/index/meta/coverage.json?x=1'));
+  assert.equal(r.route, 'index');
+  assert.equal(r.r2key, 'meta/coverage.json');
+  assert.equal(parseRoute(U('/adsb/index/meta/other.json')).status, 400);
+  stubs();
+  const body = JSON.stringify({ days: ['2026-11-05'], from: '2026-11-05', to: '2026-11-05' });
+  const env = { INDEX: { get: async (k) => (k === 'meta/coverage.json' ? { arrayBuffer: async () => new TextEncoder().encode(body).buffer } : null) } };
+  const res = await handle(new Request('https://w.example/adsb/index/meta/coverage.json'), env, undefined, new TokenBuckets());
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('Cache-Control'), 'public, max-age=60');
+  assert.deepEqual(await res.json(), JSON.parse(body));
+});

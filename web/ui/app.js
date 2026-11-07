@@ -13,6 +13,7 @@ import { scenarioDem, scenarioFromSource } from './scenario-dem.js';
 import { createLivePanel, micUnavailableReason, LIVE_T_TOL_S } from './live-panel.js';
 import { devFixtureFlights } from './dev-fixtures.js';
 import { coverage, coverageVerdict, coverageBaseline, fetchDayStatus } from '../engine/adsb.js';
+import { dateGate, fetchManifest, mergeManifest } from './coverage-gate.js';
 import { createDem } from '../engine/dem.js';
 import { detectCuts } from './segment.js';
 import { detectPasses } from './autodetect.js';
@@ -104,7 +105,7 @@ function mountHelp() {
     }
     btn.setAttribute('aria-label', t('help.label', { topic: t(`help.${key}.topic`) }));
     btn.title = t('help.label', { topic: t(`help.${key}.topic`) });
-    pop.textContent = t(`help.${key}`);
+    pop.textContent = t(`help.${key}`, covDates());
   }
 }
 
@@ -125,7 +126,7 @@ const mapPanel = createMapPanel($('map'), {
     live?.refresh();
   },
 });
-const COV = CFG.coverage;
+let COV = CFG.coverage;   // replaced at boot by the data server's availability manifest (coverage-gate.js)
 if (COV?.bbox) { mapPanel.setCoverage(COV.bbox); mapPanel.map.fitBounds([[COV.bbox[0], COV.bbox[1]], [COV.bbox[2], COV.bbox[3]]]); }
 else mapPanel.map.setView([41.6, 1.6], 7);
 
@@ -179,14 +180,13 @@ const isDemo = () => !!P.media?.demo;
 // ------------------------------------------------------------------ data coverage gate (Catalonia + Andorra, since COV.from)
 const inBox = ([lat, lon], b) => lat >= b[0] && lat <= b[2] && lon >= b[1] && lon <= b[3];
 const covFrom = () => (COV?.from ? Date.parse(`${COV.from}T00:00:00Z`) / 1000 : null);
+const covDates = () => ({ from: COV?.from ? fmtDate(covFrom()) : '—', to: COV?.to ? fmtDate(Date.parse(`${COV.to}T00:00:00Z`) / 1000) : '—' });
 /** null when flight data can exist for the chosen area and time; else an i18n key explaining why not. */
 function dataGate() {
   if (isDemo() || QS.has('nogate') || !COV) return null;
   if (P.region && COV.bbox && !inBox(P.region.center, COV.bbox)) return 'gate.area';
-  const w = timeWindow(), from = covFrom();
-  if (w && from != null && w.t1 < from) return 'gate.date';
-  if (w && w.t0 > Date.now() / 1000 + 3600) return 'gate.future';
-  return null;
+  // the search reads every UTC day the recording can touch: [start window, + duration]; live recordings bring their tracks
+  return dateGate(timeWindow(), COV, { dur: P.media?.duration || 0, live: !!P.media?.live });
 }
 
 // ------------------------------------------------------------------ media
@@ -842,7 +842,7 @@ function renderGate() {
   box.hidden = !g;
   if (!g) return;
   box.className = 'state-note state-note--warn';
-  box.replaceChildren(h('strong', {}, t(g)), h('span', {}, t(`${g}.sub`, { from: COV?.from ? fmtDate(covFrom()) : '' })));
+  box.replaceChildren(h('strong', {}, t(g)), h('span', {}, t(`${g}.sub`, covDates())));
 }
 
 function renderMedia() {
@@ -1183,7 +1183,7 @@ function renderLang() {
   for (const b of document.querySelectorAll('[data-lang]')) b.setAttribute('aria-pressed', String(b.dataset.lang === lang()));
   const canvas = $('spec-host').querySelector('canvas');
   if (canvas) { canvas.setAttribute('aria-label', t('spec.canvas')); canvas.setAttribute('role', 'img'); canvas.setAttribute('aria-roledescription', t('spec.aria')); }
-  $('legal-cov').textContent = t('legal.cov', { from: COV?.from ? fmtDate(covFrom()) : '—' });
+  $('legal-cov').textContent = t('legal.cov', covDates());
   const eb = $('engine-badge');
   eb.textContent = Engine.ENGINE_INFO.fake ? t('engine.stub') : `${t('engine')} ${Engine.ENGINE_INFO.version}`;
   mountHelp();
@@ -1454,3 +1454,5 @@ renderLang();
 if (P.region) mapPanel.setRegion(P.region, { fit: true });
 restoreTracks();
 if (draft?.media?.demo) guard(reattachDemo)();
+// which days the archive really has (falls back to config.js coverage if the manifest cannot be read)
+fetchManifest(workerUrl()).then((m) => { const c = mergeManifest(COV, m); if (c !== COV) { COV = c; renderLang(); } });

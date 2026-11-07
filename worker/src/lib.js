@@ -31,6 +31,10 @@ export function parseRoute(url, maxRangeBytes = 8388608) {
     return { route: 'range', tag, year: m[1], part, start, end,
       key: `${CACHE_ORIGIN}/adsb/range/${tag}/${part || '-'}/${start}-${end}` };
   }
+  // data availability manifest (ref/data/daily_job.py): rewritten after every uploaded day, so it is cached briefly only
+  if (p === '/adsb/index/meta/coverage.json') {
+    return { route: 'index', r2key: 'meta/coverage.json', ttl: 60, key: `${CACHE_ORIGIN}/adsb/index/meta/coverage.json` };
+  }
   let m = /^\/adsb\/index\/([^/]+)\/([^/]+)$/.exec(p);
   if (m) {
     if (!TAG_RE.test(m[1]) || !CELL_RE.test(m[2])) return { error: 'bad tag/cell', status: 400 };

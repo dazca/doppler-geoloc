@@ -20,7 +20,7 @@ test('every static data-i18n / data-help key and literal t() key exists', () => 
   for (const f of ['../ui/app.js', '../ui/live-panel.js', '../ui/map-panel.js']) {
     for (const m of read(f).matchAll(/\bt\('([a-z0-9_.-]+)'/gi)) keys.add(m[1]);
   }
-  for (const k of ['need.file', 'need.detecting', 'need.passes', 'need.time', 'need.area', 'gate.area', 'gate.date', 'gate.future',
+  for (const k of ['need.file', 'need.detecting', 'need.passes', 'need.time', 'need.area', 'gate.area', 'gate.date', 'gate.future', 'gate.missing', 'gate.missing.sub',
     'gate.area.sub', 'gate.date.sub', 'gate.future.sub', ...['prop', 'heli', 'jet', 'unknown'].map((c) => `cls.${c}`),
     ...['grid', 'cpa', 'filters', 'sim', 'score', 'refine'].map((s) => `stage.${s}`), 'pe.good', 'pe.moderate', 'pe.bad']) keys.add(k);
   const missing = [...keys].filter((k) => DICT.ca[k] == null);

@@ -2,6 +2,8 @@
 // adsbWorker: base URL of the Cloudflare Worker in worker/ (historical ADS-B /adsb/* and live /v2/point, /data/traces).
 // Empty = development: built-in sample data, live recording disabled (unless set in Advanced or with ?proxy=).
 // coverage: where and since when the flight archive has data. The UI blocks searches outside it (the demo is exempt).
+//   With a Worker, from/to/days are replaced at startup by its availability manifest (/adsb/index/meta/coverage.json,
+//   see web/ui/coverage-gate.js); these values are only the fallback when that fetch fails.
 //   bbox [lat0, lon0, lat1, lon1] (Catalonia + Andorra), from: first UTC day with tiles (YYYY-MM-DD).
 // defaultRegion: the editable search area placed when a file is loaded and no area was chosen yet.
 window.OVERHEAD_CONFIG = {

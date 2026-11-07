@@ -4,6 +4,7 @@
 //       -> bytes [start, end] (inclusive) of https://github.com/adsblol/globe_history_<YYYY>/releases/download/<tag>/<tag>.tar.<part>
 //          (one gzip trace_full_<icao>.json member; the browser gunzips it with DecompressionStream)
 //   GET /adsb/index/<tag>/<cell>.json   -> per-cell trace index shard (or day.json) from R2 (ref/data/build_index.py)
+//   GET /adsb/index/meta/coverage.json  -> data availability manifest {updated, bbox, days[], from, to} (daily_job.py), 60 s cache
 //   GET /adsb/tile/<YYYY-MM-DD>/<cell>.json      (FAST PATH)
 //       -> pre-extracted non-jet contract tracks of one 0.5 deg cell for one UTC day (ref/data/build_tiles.py),
 //          stored gzipped in R2 as tiles/<date>/<cell>.json.gz and served with Content-Encoding: gzip
@@ -67,7 +68,7 @@ async function r2(env, r) {
   // Tiles are stored gzipped. They are cached as opaque bytes (X-Body-Gzip) and only labelled Content-Encoding: gzip
   // when served, so the Cache API never re-encodes or decodes them.
   const h = { 'Content-Type': r.route === 'tile' ? 'application/octet-stream' : 'application/json',
-    'Cache-Control': 'public, max-age=86400' };
+    'Cache-Control': `public, max-age=${r.ttl || 86400}` };
   if (r.route === 'tile') h['X-Body-Gzip'] = '1';
   return new Response(await obj.arrayBuffer(), { headers: h });
 }

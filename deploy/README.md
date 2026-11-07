@@ -31,6 +31,7 @@ missing UTC day it streams the adsb.lol `prod` and `mlatonly` tars once (nothing
 | `tiles/<date>/<cell>.json.gz` (42/day) | non-jet tracks per cell, contract format (same schema as `build_tiles.py`) | `fetchTracksFromTiles`, `coverageBaseline` (±1-4 weeks) |
 | `<tag>/<cell>.json` (42 per feed/day) | `build_index.py --bbox` (byte offsets into the GitHub tar) | `fetchTracks` (the app's search path) + `/adsb/range` |
 | `<tag>/day.json` (1 per feed/day) | `build_index.py` (`ok`/`partial`/`empty`/`missing`) | `fetchDayStatus` |
+| `meta/coverage.json` (1) | availability manifest `{updated, bbox, days[], from, to}`, updated after each day's `day.json`; `--rebuild-manifest` rewrites it from the days whose two `day.json` the Worker serves (also run at the end of every GitHub run) | `web/ui/coverage-gate.js` (date gate, legal text); Worker route `/adsb/index/meta/coverage.json`, 60 s cache |
 
 `day.json` is uploaded last and is the "day done" marker: the job asks the live Worker for both feeds' `day.json` and
 skips days that have them, so re-running is cheap and a failed day is retried on the next run (catch-up). A day whose
