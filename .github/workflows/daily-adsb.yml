@@ -27,7 +27,7 @@ jobs:
       - run: pip install numpy==2.5.4 requests==2.34.2 pyproj==3.8.0
       - run: npm install --no-save wrangler@4.158.0
       # keep the small per-day trace counts (<tag>.counts.json) between runs: reference for the partial-day check
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .cache/adsb/*.counts.json
           key: adsb-counts-${{ github.run_id }}
