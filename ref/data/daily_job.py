@@ -29,6 +29,7 @@ import datetime as dt
 import gzip
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -119,11 +120,11 @@ def day_done(worker, day):
 def r2_put(bucket, key, path):
     cmd = [_npx(), "wrangler", "r2", "object", "put", f"{bucket}/{key}", "--file", path, "--remote",
            "--content-type", "application/json" if key.endswith(".json") else "application/octet-stream"]
-    for attempt in range(4):
+    for attempt in range(9):  # Cloudflare API rate limit (1200 req / 5 min): back off up to ~5 min in total
         r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=fa.ROOT)
         if r.returncode == 0:
             return
-        time.sleep(3 * (attempt + 1))
+        time.sleep(min(60, 3 * 2 ** attempt) * (0.5 + random.random()))
     raise RuntimeError(f"upload {key} failed: {(r.stderr or r.stdout)[-400:]}")
 
 
