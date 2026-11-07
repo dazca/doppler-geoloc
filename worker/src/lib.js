@@ -5,7 +5,7 @@
 // query params (?x=<random>) can no longer force a miss and an 8 MiB upstream fetch; (b) every data route is
 // rate-limited per client IP; (c) CORS is an explicit allow-list (default: production Pages domain + localhost).
 
-export const TAG_RE = /^v(\d{4})\.\d{2}\.\d{2}-planes-readsb-(prod|mlatonly|staging)-\d$/;
+export const TAG_RE = /^v(\d{4})\.\d{2}\.\d{2}-planes-readsb-(prod|mlatonly|staging)-(?:\d|0tmp)$/;
 export const PART_RE = /^(|a[a-z])$/;
 export const CELL_RE = /^(\d{5,6}|day)\.json$/; // <cell>.json, or day.json = release completeness
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -24,12 +24,17 @@ export function parseRoute(url, maxRangeBytes = 8388608) {
     const s = q.get('start'), e = q.get('end');
     const m = TAG_RE.exec(tag);
     if (!m || !PART_RE.test(part)) return { error: 'bad tag/part', status: 400 };
+    // A day's release can live in the neighbouring year's repo (e.g. Dec 31 in globe_history_<Y+1>): optional repo=YYYY.
+    const repoQ = q.get('repo');
+    if (repoQ !== null && (!/^\d{4}$/.test(repoQ) || Math.abs(Number(repoQ) - Number(m[1])) > 1)) return { error: 'bad repo', status: 400 };
+    const year = repoQ ?? m[1];
     if (!/^\d{1,15}$/.test(s || '') || !/^\d{1,15}$/.test(e || '')) return { error: 'bad range', status: 400 };
     const start = Number(s), end = Number(e);
     if (end < start) return { error: 'bad range', status: 400 };
     if (end - start + 1 > maxRangeBytes) return { error: 'range too large', status: 413 };
-    return { route: 'range', tag, year: m[1], part, start, end,
-      key: `${CACHE_ORIGIN}/adsb/range/${tag}/${part || '-'}/${start}-${end}` };
+    // the repo joins the cache key only when it differs from the tag's year, so pre-existing keys stay valid
+    return { route: 'range', tag, year, part, start, end,
+      key: `${CACHE_ORIGIN}/adsb/range/${year !== m[1] ? `r${year}/` : ''}${tag}/${part || '-'}/${start}-${end}` };
   }
   // data availability manifest (ref/data/daily_job.py): rewritten after every uploaded day, so it is cached briefly only
   if (p === '/adsb/index/meta/coverage.json') {

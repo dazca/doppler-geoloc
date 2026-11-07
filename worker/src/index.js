@@ -1,7 +1,7 @@
 // Cloudflare Worker: CORS + cache relay for adsb.lol (the only data source without CORS).
 //
-//   GET /adsb/range?tag=v2026.11.01-planes-readsb-prod-0&part=aa&start=123&end=456
-//       -> bytes [start, end] (inclusive) of https://github.com/adsblol/globe_history_<YYYY>/releases/download/<tag>/<tag>.tar.<part>
+//   GET /adsb/range?tag=v2026.11.01-planes-readsb-prod-0&part=aa&start=123&end=456[&repo=YYYY]
+//       -> bytes [start, end] (inclusive) of https://github.com/adsblol/globe_history_<repo|tag year>/releases/download/<tag>/<tag>.tar.<part>
 //          (one gzip trace_full_<icao>.json member; the browser gunzips it with DecompressionStream)
 //   GET /adsb/index/<tag>/<cell>.json   -> per-cell trace index shard (or day.json) from R2 (ref/data/build_index.py)
 //   GET /adsb/index/meta/coverage.json  -> data availability manifest {updated, bbox, days[], from, to} (daily_job.py), 60 s cache

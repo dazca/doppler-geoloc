@@ -129,10 +129,21 @@ _RELEASE_CACHE = {}       # (day, feed) -> (time, [(url, size)], release_tag, re
 RELEASE_CACHE_S = 3600
 
 
+def assert_servable(release, names):
+    """Every tar asset must be <release>.tar or <release>.tar.a[a-z]: the Worker's /adsb/range builds exactly that
+    download URL from the release tag (+ part), so an index over any other asset name could never be served.
+    Raises IncompleteRelease (the day is retried later, never published)."""
+    bad = [n for n in names if not re.fullmatch(re.escape(release) + r"\.tar(\.a[a-z])?", n)]
+    if bad:
+        raise IncompleteRelease(f"release {release}: asset name(s) {', '.join(bad)} not servable by the Worker "
+                                f"(expected {release}.tar[.aX])")
+
+
 def _check_assets(tag, assets):
     tars = sorted((a for a in assets if ".tar" in a["name"]), key=lambda a: a["name"])
     if not tars:
         raise IncompleteRelease(f"release {tag} has no tar assets yet")
+    assert_servable(tag, [a["name"] for a in tars])
     bad = [a["name"] for a in tars if a.get("state", "uploaded") != "uploaded"]
     if bad:
         raise IncompleteRelease(f"release {tag}: assets still uploading ({', '.join(bad)})")
@@ -516,6 +527,9 @@ def stream_day(session, day, feed, bbox, t0, t1, cache, log, keep_ground, worker
     workers = workers or default_workers()
     tag = tag_for(day, feed)
     parts, release, repo = find_release(day, feed, session)
+    if not TAG_RE.search(release) or not release.startswith(tag[:-1]):
+        raise IncompleteRelease(f"{tag}: release tag {release!r} not servable by the Worker")
+    assert_servable(release, [u.rsplit("/", 1)[-1] for u, _ in parts])
     resolved = [resolve(session, u) for u, _ in parts]
     sizes = [rs for _, rs in resolved]
     for (u, s_api), s_head in zip(parts, sizes):

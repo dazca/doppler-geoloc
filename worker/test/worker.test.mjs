@@ -194,3 +194,22 @@ test('handler: upstream errors on non-R2 routes are still not cached', async () 
   assert.equal(r.status, 404);
   assert.equal(store.size, 0);
 });
+
+test('range: neighbouring-year repo and -0tmp/-1 tags (review F1)', async () => {
+  const D31 = 'v2025.12.31-planes-readsb-prod-0tmp';
+  const r = parseRoute(U(`/adsb/range?tag=${D31}&part=aa&start=0&end=9&repo=2026`));
+  assert.equal(r.year, '2026');
+  assert.equal(r.key, `https://cache.internal/adsb/range/r2026/${D31}/aa/0-9`);
+  // repo equal to the tag year: same key as without repo (old cache entries stay valid)
+  assert.equal(parseRoute(U(`/adsb/range?tag=${TAG}&start=0&end=9&repo=2026`)).key, parseRoute(U(`/adsb/range?tag=${TAG}&start=0&end=9`)).key);
+  assert.equal(parseRoute(U(`/adsb/range?tag=v2026.11.01-planes-readsb-prod-1&start=0&end=9`)).year, '2026');
+  assert.equal(parseRoute(U(`/adsb/range?tag=${TAG}&start=0&end=9&repo=2030`)).status, 400);
+  assert.equal(parseRoute(U(`/adsb/range?tag=${TAG}&start=0&end=9&repo=26`)).status, 400);
+  assert.equal(parseRoute(U(`/adsb/range?tag=${TAG}&start=0&end=9&repo=`)).status, 400);
+  assert.equal(parseRoute(U('/adsb/range?tag=v2026.11.01-planes-readsb-prod-1tmp&start=0&end=9')).status, 400);
+  assert.equal(parseRoute(U(`/adsb/index/${D31}/day.json`)).r2key, `${D31}/day.json`);
+  const { upstream } = stubs();
+  const res = await handle(new Request(`https://w.example/adsb/range?tag=${D31}&part=aa&start=0&end=9&repo=2026`), {}, undefined, new TokenBuckets());
+  assert.equal(res.status, 200);
+  assert.equal(upstream[0][0], `https://github.com/adsblol/globe_history_2026/releases/download/${D31}/${D31}.tar.aa`);
+});

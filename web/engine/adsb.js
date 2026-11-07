@@ -29,6 +29,16 @@ export function tagFor(tUnix, feed = 'prod') {
   return `v${d.slice(0, 4)}.${d.slice(5, 7)}.${d.slice(8, 10)}-planes-readsb-${feed}-0`;
 }
 
+/**
+ * Where a shard's byte offsets point: {release, repo}.  release = the shard's real release tag (default: the canonical
+ * tag); repo = 'YYYY' only when the shard's globe_history_YYYY differs from the release tag's year (else undefined).
+ */
+export function rangeSource(tag, sh = {}) {
+  const release = typeof sh.release === 'string' && /^v\d{4}\.\d{2}\.\d{2}-planes-readsb-[a-z]+-(\d|0tmp)$/.test(sh.release) ? sh.release : tag;
+  const m = /^globe_history_(\d{4})$/.exec(sh.repo || '');
+  return { release, repo: m && m[1] !== release.slice(1, 5) ? m[1] : undefined };
+}
+
 export function categoryFor(type, types) {
   const e = type && types ? types[type] : null;
   return e ? e[0] : 'unknown';
@@ -169,9 +179,11 @@ export async function fetchTracks({ worker, bbox, t0, t1, feeds = ['prod', 'mlat
       if (!r.ok) { failed.push(`index ${tag}/${cell}: HTTP ${r.status}`); continue; }
       const sh = await r.json();
       geoidN += sh.geoid_N; nN++;
+      // F1: the bytes live in the real release (-0tmp/-1 re-runs) and repo (Dec 31 can be in next year's repo)
+      const rel = rangeSource(tag, sh);
       for (const [icao, type, part, start, size, tmin, tmax, minAlt] of sh.traces) {
         if (skipJets && categoryFor(type, types) === 'jet') continue;
-        if (tmax >= t0 && tmin <= t1 && minAlt <= maxAltFt) jobs.push({ tag, icao, part, start, size });
+        if (tmax >= t0 && tmin <= t1 && minAlt <= maxAltFt) jobs.push({ tag, ...rel, icao, part, start, size });
       }
     }
   }
@@ -181,7 +193,7 @@ export async function fetchTracks({ worker, bbox, t0, t1, feeds = ['prod', 'mlat
     throw err;
   }
   geoidN = nN ? geoidN / nN : 0; // N varies < ~3 m over a 150 km bbox; one value is enough
-  const uniq = [...new Map(jobs.map((j) => [`${j.tag}/${j.part}/${j.start}`, j])).values()];
+  const uniq = [...new Map(jobs.map((j) => [`${j.repo || ''}/${j.release}/${j.part}/${j.start}`, j])).values()];
   const traces = [];
   let done = 0;
   const total = uniq.length;
@@ -189,7 +201,7 @@ export async function fetchTracks({ worker, bbox, t0, t1, feeds = ['prod', 'mlat
     while (uniq.length) {
       const j = uniq.pop();
       try {
-        const r = await fetchRetry(f, `${worker}/adsb/range?tag=${j.tag}&part=${j.part}&start=${j.start}&end=${j.start + j.size - 1}`, retry);
+        const r = await fetchRetry(f, `${worker}/adsb/range?tag=${j.release}&part=${j.part}&start=${j.start}&end=${j.start + j.size - 1}${j.repo ? `&repo=${j.repo}` : ''}`, retry);
         if (!r.ok) throw new Error(`range ${j.icao}: HTTP ${r.status}`);
         traces.push({ feed: j.tag.includes('mlatonly') ? 'mlatonly' : 'prod',
           d: JSON.parse(await gunzip(new Uint8Array(await r.arrayBuffer()))) });

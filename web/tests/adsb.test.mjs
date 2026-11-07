@@ -135,3 +135,29 @@ test('fetchRetry lets AbortError through without retrying', async () => {
   await assert.rejects(fetchRetry(f, 'u', noSleep), (e) => e.name === 'AbortError');
   assert.equal(n, 1);
 });
+
+test('fetchTracks: range URL uses the shard release tag and repo (review F1)', async () => {
+  const t0 = Date.UTC(2025, 11, 31, 14) / 1000;
+  const urls = [];
+  const f = async (u) => {
+    urls.push(u);
+    if (u.includes('/adsb/index/') && u.includes('prod') && !u.includes('day.json')) {
+      return json({ geoid_N: 50, release: 'v2025.12.31-planes-readsb-prod-0tmp', repo: 'globe_history_2026',
+        traces: [['3464cd', 'P208', 'aa', 0, 100, t0, t0 + 600, 1000]] });
+    }
+    return new Response('', { status: 404 });
+  };
+  await fetchTracks({ worker: 'w', bbox: [41.5, 2.0, 41.51, 2.01], t0, t1: t0 + 3600, fetch: f, retry: noSleep });
+  const range = urls.filter((u) => u.includes('/adsb/range'));
+  assert.deepEqual(range, ['w/adsb/range?tag=v2025.12.31-planes-readsb-prod-0tmp&part=aa&start=0&end=99&repo=2026']);
+  assert.ok(urls.some((u) => u.includes('/adsb/index/v2025.12.31-planes-readsb-prod-0/')), 'index still uses the canonical tag');
+});
+
+test('rangeSource: repo only when it differs from the release year; bad values ignored', async () => {
+  const { rangeSource } = await import('../engine/adsb.js');
+  const T = 'v2026.11.01-planes-readsb-prod-0';
+  assert.deepEqual(rangeSource(T, {}), { release: T, repo: undefined });
+  assert.deepEqual(rangeSource(T, { release: 'v2026.11.01-planes-readsb-prod-1', repo: 'globe_history_2026' }),
+    { release: 'v2026.11.01-planes-readsb-prod-1', repo: undefined });
+  assert.deepEqual(rangeSource(T, { release: 'evil&x=1', repo: 'globe_history_x' }), { release: T, repo: undefined });
+});

@@ -90,9 +90,12 @@ class _BytesStreamer(fa.TarStreamer):
             yield self.data[i:i + self.chunk]
 
 
+_REL = "v2026.11.06-planes-readsb-prod-1"
+
+
 def _patch_stream(monkeypatch, members):
     data = _tar_bytes(members)
-    monkeypatch.setattr(fa, "find_release", lambda day, feed, s: ([("https://x/t.tar", len(data))], "TAGX-1", 2027))
+    monkeypatch.setattr(fa, "find_release", lambda day, feed, s: ([(f"https://x/{_REL}.tar", len(data))], _REL, 2027))
     monkeypatch.setattr(fa, "resolve", lambda s, u: (u, len(data)))
     monkeypatch.setattr(fa, "TarStreamer", lambda s, urls, log: _BytesStreamer(data))
 
@@ -115,7 +118,7 @@ def test_stream_day_ok_records_release(tmp_path, monkeypatch):
     assert len(found) == 70 and isinstance(found[0][1][0][0], fa.Pt)
     with gzip.open(tmp_path / "v2026.11.06-planes-readsb-prod-0.idx.json.gz", "rt") as f:
         idx = json.load(f)
-    assert len(idx["traces"]) == 71 and idx["release"] == "TAGX-1" and idx["repo"] == "globe_history_2027"
+    assert len(idx["traces"]) == 71 and idx["release"] == _REL and idx["repo"] == "globe_history_2027"
 
 
 def test_default_workers_capped():
@@ -231,6 +234,20 @@ def test_release_incomplete_and_missing():
     with pytest.raises(fa.MissingRelease) as e:
         fa.find_release(dt.date(2023, 2, 20), "prod", _GH({}))
     assert not isinstance(e.value, fa.IncompleteRelease)
+
+
+def test_release_asset_names_must_be_servable(tmp_path, monkeypatch):
+    """review F1: never index a release whose asset names the Worker's /adsb/range cannot rebuild."""
+    tag = "v2026.11.05-planes-readsb-prod-0"
+    odd = [{"name": f"{tag}.tar.aa", "size": 5, "state": "uploaded"},
+           {"name": f"{tag}-extra.tar.ab", "size": 5, "state": "uploaded"}]
+    fa._RELEASE_CACHE.clear()
+    with pytest.raises(fa.IncompleteRelease, match="not servable"):
+        fa.find_release(dt.date(2026, 11, 5), "prod", _GH({(2026, tag): odd}))
+    fa._RELEASE_CACHE.clear()
+    monkeypatch.setattr(fa, "find_release", lambda d, f, s: ([("https://x/other.tar.aa", 5)], tag, 2026))
+    with pytest.raises(fa.IncompleteRelease, match="not servable"):
+        fa.stream_day(None, dt.date(2026, 11, 5), "prod", (41, 2, 42, 3), 0, 1e10, str(tmp_path), lambda *a: None, False)
 
 
 def test_tag_re():
