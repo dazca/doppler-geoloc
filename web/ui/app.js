@@ -207,12 +207,16 @@ async function loadMedia(file, { demo = null, keepProject = false, forceRange = 
   try {
     busy(t('busy.read', { name: file.name }), null);
     const meta = await readMediaMeta(file).catch(() => null);
-    const estDur = meta?.durationSec || await probeDuration(file);
+    let track = null;
+    if (meta?.container === 'isobmff') track = await readAudioTrack(file).catch(() => null);
+    // never trust mvhd alone: the sample table says how much audio a decode would really produce
+    const trackDur = track?.n ? Math.max(track.duration,
+      (track.dts[track.n - 1] - track.mediaTime) / track.timescale + track.delay + 1024 / track.sampleRate) : 0;
+    const estDur = Math.max(meta?.durationSec || 0, trackDur) || await probeDuration(file);
     let crop = (same || keepProject) && P.media?.crop ? P.media.crop : null;
     // streamable = decodeAudioFile can stream it: an MP4/MOV only if its moov has an AAC sample table we can read
     // (LPCM / other codecs / fragmented MP4 are decoded whole, which the memory estimate must know)
-    const streamable = meta?.container === 'isobmff' ? await readAudioTrack(file).then(() => true, () => false)
-      : /\.wav$/i.test(file.name || '');
+    const streamable = meta?.container === 'isobmff' ? !!track : /\.wav$/i.test(file.name || '');
     if (forceRange || (!crop && isLarge(file, estDur, streamable))) {
       busy(null);
       const choice = await askLargeFile(file, estDur, crop, streamable);

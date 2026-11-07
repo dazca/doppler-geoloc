@@ -496,6 +496,9 @@ export async function decodeMp4Stream(file, { sampleRate = 8000, crop = null, on
   const pt = (s) => (tr.dts[s] - tr.mediaTime) / tr.timescale + tr.delay;
   // a crafted mdhd can claim hours over a few samples: never decode (silence) beyond the last real sample + 1 s
   const lastEnd = pt(tr.n - 1) + 1024 / tr.sampleRate;
+  // n AAC frames hold at most n*2048 samples (HE-AAC): timestamps stretched far beyond that are a crafted file
+  const realS = tr.n * 2048 / tr.sampleRate;
+  if (!(tr.delay <= 60 + realS) || !(lastEnd - pt(0) <= 2 * realS + 60)) throw audioError('not-streamable', 'timestamps span too long');
   const duration = Math.max(0, Math.min(tr.duration - tr.mediaTime / tr.timescale + tr.delay, lastEnd + 1));
   const a = crop ? Math.max(0, crop[0]) : 0, b = crop ? Math.min(duration, crop[1]) : duration;
   if (!(b > a)) throw audioError('bad-range', 'The chosen range is outside the recording.');
