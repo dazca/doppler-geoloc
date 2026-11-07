@@ -40,6 +40,12 @@ import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
+# No multi-threaded BLAS here (only small vector ops): one OpenBLAS thread avoids per-thread buffers being committed in
+# the main process and in every parse worker (a worker died at import with "OpenBLAS: Memory allocation failed" when
+# the machine was low on RAM).  Must be set before numpy is imported; child processes inherit it.
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import numpy as np
 import requests
 
