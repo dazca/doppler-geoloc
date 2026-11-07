@@ -1,0 +1,12 @@
+# Weekly update PRs for the pinned GitHub Actions (SHA pins) and the hash-locked CI wheels.
+# cooldown: only propose releases at least 7 days old (supply-chain buffer against freshly compromised releases).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    cooldown: { default-days: 7 }
+  - package-ecosystem: pip
+    directory: /ref/data
+    schedule: { interval: weekly }
+    cooldown: { default-days: 7 }

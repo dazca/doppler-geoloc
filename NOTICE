@@ -1,0 +1,37 @@
+doppler-geoloc - third-party data and attributions
+====================================================
+
+This file lists third-party data used or referenced by this project. It does not grant a licence to the
+project's own code (no licence has been chosen for it yet).
+
+ADS-B flight data - adsb.lol
+  Historical traces (github.com/adsblol/globe_history_<year> releases) and the live API (api.adsb.lol).
+  (c) adsb.lol contributors, made available under the Open Database License (ODbL) 1.0:
+  https://opendatacommons.org/licenses/odbl/1-0/
+  The per-day tiles and index shards served from https://doppler-data.azemar.eu (built by ref/data/) are a
+  derived database of adsb.lol data and are likewise made available under the ODbL 1.0; responses carry
+  `Link: <https://opendatacommons.org/licenses/odbl/1-0/>; rel="license"` and `X-Source: adsb.lol`.
+
+Aircraft type categories - web/data/types.json
+  Derived from tar1090-db (github.com/wiedehopf/tar1090-db, db/icao_aircraft_types2.js), whose data comes from
+  the Mictronics aircraft database (ICAO Doc 8643 type designators / description codes).
+  No licence declared upstream: tar1090-db has no LICENSE file and Mictronics states no licence for this data.
+  Used for attribution and interoperability only; it will be removed or replaced if the upstream owners object.
+
+Terrain elevation - AWS Terrain Tiles (Terrarium), fetched at runtime by the browser
+  s3.amazonaws.com/elevation-tiles-prod/terrarium/ - Mapzen and contributors; see
+  https://github.com/tilezen/joerd/blob/master/docs/attribution.md
+  For Europe: "Europe terrain data produced using Copernicus data and information funded by the European Union -
+  EU-DEM layers."
+
+Base maps (fetched at runtime by the browser, not redistributed)
+  (c) OpenStreetMap contributors (ODbL), https://www.openstreetmap.org/copyright
+  (c) Esri and partners (Esri, HERE, Garmin).
+
+Leaflet 1.9.4 - loaded from unpkg.com at runtime (not redistributed); BSD-2-Clause, (c) Volodymyr Agafonkin and
+  contributors.
+
+Referenced by link only (no content is copied into or redistributed by this repository)
+  YouTube videos (e.g. the OSINT method cited in docs/CONTRACTS.md) and Freesound recordings (docs/REAL_CASES.md)
+  used as examples or test material are referenced by URL only; they remain under their owners' own terms. Downloaded audio is kept
+  out of the repository (see .gitignore: *.wav, *.mp4, fixtures/).

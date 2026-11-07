@@ -16,3 +16,4 @@ ref/validation/out/
 .env
 .env.*
 .claude/
+.dev.vars*
