@@ -31,7 +31,7 @@ jobs:
           restore-keys: adsb-counts-
       - name: Build + upload missing days (catch-up over the last 30 days; at most 5 per run)
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.CLOUDFARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: a1cd2a86a35ae7d3f0d9ec23c95ac31e
           PROJ_NETWORK: "ON"
           ONE_DATE: ${{ inputs.date }}
@@ -43,6 +43,6 @@ jobs:
       - name: Rebuild the data availability manifest
         if: ${{ !cancelled() }}
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.CLOUDFARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: a1cd2a86a35ae7d3f0d9ec23c95ac31e
         run: python ref/data/daily_job.py --rebuild-manifest
