@@ -88,3 +88,28 @@ test('runSearch API: faithful mode, ridge refit of CPA time, abort', async () =>
   await assert.rejects(p, (e) => e.name === 'AbortError');
   assert.ok(performance.now() - t < 300 + 250);
 });
+
+test('cropZ: with t_sigma_s 30 the cropped Z scores exactly like the full Z (review F5)', async () => {
+  const sc = loadScenario('scenario1');
+  const s = sc.spec, padT = Math.round(1400 / s.dt);   // pad the recording so the crop really happens
+  const data = new Float32Array((s.nT + padT) * s.nF);
+  data.set(s.data);
+  for (let i = s.nT; i < s.nT + padT; i++) data.set(s.data.subarray((i % s.nT) * s.nF, (i % s.nT + 1) * s.nF), i * s.nF);
+  const spec = { ...s, nT: s.nT + padT, data };
+  const events = apiInput(sc).events.map((e) => ({ ...e, t_sigma_s: 30 }));
+  const cfg = (await import('../engine/geoloc/search.js')).makeConfig({});
+  const crop = Engine.cropZToEvents({ t0: spec.t0, dt: spec.dt, nT: spec.nT, nF: spec.nF }, new Float32Array(spec.nT * spec.nF), events, cfg);
+  assert.ok(crop.zs.nT < spec.nT, 'the test must exercise a real crop');
+  const run = (cropZ) => Engine.runSearch(apiInput(sc, { cropZ, refine: false }, { events, spec, duration_s: spec.nT * spec.dt }));
+  const full = await run(false), cut = await run(true);
+  const top = (r) => r.candidates.slice(0, 5).map((c) => [c.lat.toFixed(5), c.lon.toFixed(5), c.score.toFixed(6), c.t_start_unix.toFixed(2)]);
+  assert.deepEqual(top(cut), top(full));
+  // every grid point, not just the winners: positions whose offsets reach the edge of the window score the same too
+  let worst = 0;
+  for (let i = 0; i < full.field.values.length; i++) {
+    const a = full.field.values[i], b = cut.field.values[i];
+    worst = Math.max(worst, Number.isFinite(a) || Number.isFinite(b) ? Math.abs(a - b) || 0 : 0);
+    if (Number.isFinite(a) !== Number.isFinite(b)) worst = Infinity;
+  }
+  assert.ok(worst < 1e-9, `field differs by ${worst}`);
+});

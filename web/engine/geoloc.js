@@ -176,8 +176,14 @@ export function releaseEngine() { pool?.close(); pool = null; poolSize = 0; }
 const zCropCache = new WeakMap();
 export function cropZToEvents(zs, Z, events, cfg = {}) {
   const ts = events.map((e) => e.t_cpa_audio).filter(Number.isFinite);
-  if (!ts.length) return { zs, Z };
-  const margin = (cfg.tau_half ?? 60) + Math.max(cfg.delta_half ?? 4, cfg.soft?.delta_half_coarse ?? 12) + (cfg.soft?.offset_gate ?? 30) + 60;
+  if (!ts.length || cfg.use_offset_filter === false) return { zs, Z }; // no offset gate: any time offset can score
+  // The window must cover everything the search can reach (filters.js / search.js): the per-event offset gate
+  // (>= 3 x hypot of two events' time sigmas, each >= sigma_t and the event's own t_sigma_s) and the T_start sweep.
+  const sd = cfg.soft || {};
+  const tSig = Math.max(sd.sigma_t ?? 8, ...events.map((e) => e.t_sigma_s || 0));
+  const gate = Math.max(sd.offset_gate ?? 30, cfg.offset_tol ?? 8, 3 * Math.SQRT2 * tSig);
+  const dHalf = Math.max(cfg.delta_half ?? 4, sd.delta_half_coarse ?? 12, Math.min(40, 2 * Math.max(0, ...events.map((e) => e.t_sigma_s || 0))));
+  const margin = (cfg.tau_half ?? 60) + dHalf + gate + 60;
   const i0 = Math.max(0, Math.floor((Math.min(...ts) - margin - zs.t0) / zs.dt) - 2);
   const i1 = Math.min(zs.nT, Math.ceil((Math.max(...ts) + margin - zs.t0) / zs.dt) + 3);
   if (i1 - i0 < 2 || (i1 - i0) > 0.7 * zs.nT) return { zs, Z };   // not worth a copy

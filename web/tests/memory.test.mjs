@@ -167,6 +167,10 @@ test('B3: worker pool sized by Z bytes and device memory; Z cropped to the event
   const i0 = Math.round((c.t0 - zs.t0) / zs.dt);
   assert.equal(cz[0], Z[i0 * zs.nF]); assert.equal(cz.length, c.nT * zs.nF);
   assert.equal(cropZToEvents(zs, Z, [{ t_cpa_audio: 100 }, { t_cpa_audio: 3700 }], {}).Z, Z);   // spans everything: no copy
+  assert.equal(cropZToEvents(zs, Z, [{ t_cpa_audio: 1500 }], { use_offset_filter: false }).Z, Z); // no gate: no crop
+  // per-event time uncertainty widens the window: 3*sqrt2*30 s gate + min(40, 60) s sweep
+  const w = cropZToEvents(zs, Z, [{ t_cpa_audio: 1500, t_sigma_s: 30 }], { tau_half: 60, delta_half: 4, soft: { offset_gate: 30, sigma_t: 8, delta_half_coarse: 12 } }).zs;
+  assert.ok(w.t0 <= 1500 - (60 + 40 + 3 * Math.SQRT2 * 30 + 60));
 });
 
 // ------------------------------------------------------------------ B11 whitened spectrogram from the worker
