@@ -28,9 +28,9 @@ Altitude -> MSL (contract alt_m_msl):
 """
 import argparse
 import glob
-import threading
-import multiprocessing as mp
+import re
 from array import array
+from collections import deque, namedtuple
 import datetime as dt
 import gzip
 import json
@@ -38,7 +38,7 @@ import math
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import numpy as np
 import requests
@@ -51,6 +51,7 @@ CELL = 0.5            # index cell size, degrees
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEFAULT_CACHE = os.path.join(ROOT, ".cache", "adsb")
 UA = {"User-Agent": "doppler-geoloc-research (ref/data/fetch_adsb.py)"}
+LICENSE = {"license": "ODbL-1.0", "license_url": "https://opendatacommons.org/licenses/odbl/1-0/"}  # adsb.lol data
 LEG_GAP_S = 300.0
 CAL_MAX_BARO_FT = 10000  # geom-baro offset grows with height (temperature): calibrate on low traffic only
 
@@ -82,39 +83,120 @@ class MissingRelease(RuntimeError):
     """The release for this day/feed does not exist (e.g. no mlatonly feed before ~2024-03, or not published yet)."""
 
 
-def tag_for(day, feed):
-    return f"v{day:%Y.%m.%d}-planes-readsb-{feed}-0"
+class IncompleteRelease(MissingRelease):
+    """The release exists but is still being uploaded (an asset not 'uploaded' yet, or the last part is exactly
+    PART bytes so more parts may follow).  Always retried later, never published as 'missing'."""
 
 
-def part_urls(day, feed, session):
-    """Ordered part URLs.  Tries the GitHub API (60 req/h unauthenticated); falls back to probing."""
-    tag = tag_for(day, feed)
-    base = f"https://github.com/adsblol/globe_history_{day.year}/releases/download/{tag}/{tag}.tar"
-    try:
-        r = session.get(f"https://api.github.com/repos/adsblol/globe_history_{day.year}/releases/tags/{tag}",
-                        timeout=30)
-        if r.status_code == 404:
-            raise MissingRelease(f"release {tag} not found (no such feed that day, or not published yet: "
-                                 f"days appear on D+1 ~00:20-03:30 UTC)")
-        if r.ok:
-            names = sorted(a["name"] for a in r.json()["assets"] if ".tar" in a["name"])
-            return [(f"{base[:base.rfind('/')]}/{n}", None) for n in names]
-    except requests.RequestException:
-        pass
-    # API rate-limited: probe .tar, .tar.aa, .tar.ab ...
+# Release tags end in -0 normally; adsb.lol occasionally publishes -0tmp or -1 (re-runs).  Our cache files and R2 keys
+# always use the canonical -0 tag (tag_for); the real release tag is kept in the index / day.json as "release".
+TAG_RE = re.compile(r"-(\d|0tmp)$")
+TAG_SUFFIXES = ("0", "0tmp", "1")
+GH_API = "https://api.github.com"
+GH_DL = "https://github.com/adsblol"
+
+
+def tag_for(day, feed, suffix="0"):
+    return f"v{day:%Y.%m.%d}-planes-readsb-{feed}-{suffix}"
+
+
+def feed_of_tag(tag):
+    return TAG_RE.sub("", tag.split("-readsb-")[1])
+
+
+def repo_years(day):
+    """globe_history_<year> repos that may hold the day's release, in order: a day's release normally lives in its
+    own year's repo, but Dec 31 is published into next year's repo and some early-January (staging) days into the
+    previous year's repo."""
+    return (day.year, day.year + 1, day.year - 1)
+
+
+def gh_headers():
+    h = {"Accept": "application/vnd.github+json"}
+    tok = os.environ.get("GITHUB_TOKEN")
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
+    return h
+
+
+_RELEASE_CACHE = {}       # (day, feed) -> (time, [(url, size)], release_tag, repo_year)
+RELEASE_CACHE_S = 3600
+
+
+def _check_assets(tag, assets):
+    tars = sorted((a for a in assets if ".tar" in a["name"]), key=lambda a: a["name"])
+    if not tars:
+        raise IncompleteRelease(f"release {tag} has no tar assets yet")
+    bad = [a["name"] for a in tars if a.get("state", "uploaded") != "uploaded"]
+    if bad:
+        raise IncompleteRelease(f"release {tag}: assets still uploading ({', '.join(bad)})")
+    if tars[-1].get("size") == PART:
+        raise IncompleteRelease(f"release {tag}: last part {tars[-1]['name']} is exactly {PART} bytes "
+                                f"(more parts are probably still being uploaded)")
+    return tars
+
+
+def find_release(day, feed, session):
+    """-> ([(url, size)], release_tag, repo_year) of the day's release.  Raises MissingRelease / IncompleteRelease.
+    GitHub API first (60 req/h unauthenticated, 5000 with GITHUB_TOKEN); falls back to probing when rate-limited.
+    Memoised for RELEASE_CACHE_S so the daily job's precheck and the stream share one lookup."""
+    key = (day, feed)
+    hit = _RELEASE_CACHE.get(key)
+    if hit and time.time() - hit[0] < RELEASE_CACHE_S:
+        return hit[1:]
+    api_ok = True
+    for suf in TAG_SUFFIXES:
+        tag = tag_for(day, feed, suf)
+        for y in repo_years(day):
+            if api_ok:
+                try:
+                    r = session.get(f"{GH_API}/repos/adsblol/globe_history_{y}/releases/tags/{tag}",
+                                    headers=gh_headers(), timeout=30)
+                except requests.RequestException:
+                    r = None
+                if r is not None and r.status_code == 404:
+                    continue
+                if r is not None and r.ok:
+                    tars = _check_assets(tag, r.json().get("assets", []))
+                    out = ([(f"{GH_DL}/globe_history_{y}/releases/download/{tag}/{a['name']}", a.get("size"))
+                            for a in tars], tag, y)
+                    _RELEASE_CACHE[key] = (time.time(), *out)
+                    return out
+                api_ok = False  # rate-limited / API down: probe the download URLs from here on
+            out = _probe_release(session, y, tag)
+            if out:
+                res = (out, tag, y)
+                _RELEASE_CACHE[key] = (time.time(), *res)
+                return res
+    raise MissingRelease(f"release {tag_for(day, feed)} not found in globe_history_{'/'.join(map(str, repo_years(day)))}"
+                         f" (also -0tmp/-1; no such feed that day, or not published yet: days appear on D+1 "
+                         f"~00:20-03:30 UTC)")
+
+
+def _probe_release(session, year, tag):
+    """[(url, size)] by HEAD-probing .tar, .tar.aa, .tar.ab ... (no asset state available: size check only)."""
+    base = f"{GH_DL}/globe_history_{year}/releases/download/{tag}/{tag}.tar"
     out = []
-    for suf in ["", ".aa", ".ab", ".ac", ".ad", ".ae"]:
-        h = session.head(base + suf, allow_redirects=True, timeout=30)
-        if h.ok:
-            out.append((base + suf, None))
+    for suf in ["", ".aa", ".ab", ".ac", ".ad", ".ae", ".af"]:
+        try:
+            h = session.head(base + suf, allow_redirects=True, timeout=30)
+        except requests.RequestException:
+            h = None
+        if h is not None and h.ok:
+            out.append((base + suf, int(h.headers.get("Content-Length") or 0) or None))
             if suf == "":
                 break
         elif suf:
             if out or suf != ".aa":
                 break
-    if not out:
-        raise MissingRelease(f"no tar parts for {tag}")
+    if out and out[-1][1] == PART:
+        raise IncompleteRelease(f"release {tag}: last part is exactly {PART} bytes (more parts probably pending)")
     return out
+
+
+def part_urls(day, feed, session):
+    """Ordered [(url, size)] of the day's tar parts (see find_release)."""
+    return find_release(day, feed, session)[0]
 
 
 def resolve(session, url):
@@ -162,8 +244,12 @@ def footprint(d):
     return fp
 
 
+# One raw point of a leg.  A namedtuple (not an 11-key dict): ~5x smaller in RAM and in the worker->parent pickle.
+Pt = namedtuple("Pt", "t lat lon geom baro ground src cs gs trk vr")
+
+
 def extract(d, bbox, t0, t1, keep_ground=False):
-    """readsb trace dict -> list of raw legs (each a list of point dicts) inside bbox/window."""
+    """readsb trace dict -> list of raw legs (each a list of Pt) inside bbox/window."""
     la0, lo0, la1, lo1 = bbox
     base = float(d.get("timestamp", 0.0))
     legs, cur, last_t = [], [], None
@@ -196,6 +282,8 @@ def extract(d, bbox, t0, t1, keep_ground=False):
         if baro is not None and (flags & 8):       # altitude field itself is geometric
             geom, baro = (geom if geom is not None else baro), None
         src = p[9] if len(p) > 9 else None
+        if isinstance(src, str):
+            src = sys.intern(src)                  # one shared object per source name (RAM + pickle memo)
         if isinstance(src, str) and src.startswith("tisb") and baro is not None:
             geom = None                            # TIS-B (radar) "geometric" alt is unreliable: use baro
         if geom is None and baro is None and p[3] != "ground":
@@ -204,9 +292,7 @@ def extract(d, bbox, t0, t1, keep_ground=False):
         gs = p[4] if len(p) > 4 and isinstance(p[4], (int, float)) else None
         trk = p[5] if len(p) > 5 and isinstance(p[5], (int, float)) else None
         vr = p[11] if len(p) > 11 and isinstance(p[11], (int, float)) else (p[7] if len(p) > 7 and isinstance(p[7], (int, float)) else None)
-        cur.append({"t": t, "lat": lat, "lon": lon, "geom": geom, "baro": baro,
-                    "ground": p[3] == "ground", "src": src,
-                    "cs": callsign, "gs": gs, "trk": trk, "vr": vr})
+        cur.append(Pt(t, lat, lon, geom, baro, p[3] == "ground", src, callsign, gs, trk, vr))
         last_t = t
     if cur:
         legs.append(cur)
@@ -214,70 +300,89 @@ def extract(d, bbox, t0, t1, keep_ground=False):
 
 
 # ----------------------------------------------------------------- tar streaming / index
+class TruncatedTar(RuntimeError):
+    """The tar stream ended mid-member or before the end-of-archive marker (two zero blocks)."""
+
+
 class TarStreamer:
-    """Iterate (global_offset, name, data) over the concatenated parts of a split tar."""
+    """Iterate (global_offset, name, data) over the concatenated parts of a split tar.
+    urls: [url] or [(url, expected_size or None)].  A dropped download is resumed with a Range request (up to
+    MAX_RESUMES times per part); a part shorter than its expected size, or a stream that ends mid-member or without the
+    two zero blocks, raises TruncatedTar instead of silently producing a short index."""
+    MAX_RESUMES = 3
 
     def __init__(self, session, urls, log):
-        self.s, self.urls, self.log = session, urls, log
+        self.s, self.log = session, log
+        self.urls = [u if isinstance(u, (tuple, list)) else (u, None) for u in urls]
 
     def chunks(self):
-        for u in self.urls:
-            with self.s.get(u, stream=True, timeout=120) as r:
-                r.raise_for_status()
-                yield from r.iter_content(chunk_size=1 << 22)
+        for u, size in self.urls:
+            got, resumes = 0, 0
+            while True:
+                hdr = {"Range": f"bytes={got}-"} if got else {}
+                try:
+                    with self.s.get(u, stream=True, timeout=120, headers=hdr) as r:
+                        r.raise_for_status()
+                        if got and r.status_code != 206:
+                            raise TruncatedTar(f"server ignored the resume Range request for {u}")
+                        for c in r.iter_content(chunk_size=1 << 22):
+                            got += len(c)
+                            yield c
+                    if size is None or got >= size:
+                        break
+                    err = f"part ended at {got} of {size} bytes"
+                except (requests.ConnectionError, requests.Timeout,
+                        requests.exceptions.ChunkedEncodingError) as e:
+                    err = f"{type(e).__name__}: {e}"
+                if resumes >= self.MAX_RESUMES:
+                    raise TruncatedTar(f"{u}: download dropped {resumes + 1} times ({err})")
+                resumes += 1
+                self.log(f"  download dropped at {got/1e9:.2f} GB ({err}); resuming ({resumes}/{self.MAX_RESUMES})")
+                time.sleep(2 * resumes)
 
     def members(self):
         buf = bytearray()
         pos = 0          # global offset of buf[0]
-        need_hdr = True
-        size = 0
-        name = ""
-        hdr_off = 0
         t_start = time.time()
         next_log = 250e6
         it = self.chunks()
         eof = False
-        while True:
-            want = 512 if need_hdr else ((size + 511) // 512) * 512
-            while len(buf) < want and not eof:
+
+        def fill(n):
+            nonlocal buf, eof
+            while len(buf) < n and not eof:
                 try:
                     buf += next(it)
                 except StopIteration:
                     eof = True
-            if len(buf) < want:
+            return len(buf) >= n
+
+        while True:
+            if not fill(512):
+                raise TruncatedTar(f"tar ended at {pos + len(buf)} bytes without the end-of-archive marker")
+            h = bytes(buf[:512])
+            if h == b"\0" * 512:
+                if not fill(1024) or bytes(buf[512:1024]) != b"\0" * 512:
+                    raise TruncatedTar(f"tar ended at {pos + len(buf)} bytes after a single zero block")
                 return
-            if need_hdr:
-                h = bytes(buf[:512])
-                if h == b"\0" * 512:
-                    return
-                name = h[0:100].rstrip(b"\0").decode("utf-8", "replace")
-                prefix = h[345:500].rstrip(b"\0").decode("utf-8", "replace")
-                if prefix:
-                    name = prefix + "/" + name
-                sz = h[124:136]
-                size = int.from_bytes(sz[1:], "big") if sz[0] & 0x80 else int(sz.strip(b"\0 ") or b"0", 8)
-                typ = h[156:157]
-                hdr_off = pos
-                del buf[:512]
-                pos += 512
-                need_hdr = False
-                if typ not in (b"0", b"\0"):
-                    size_pad = ((size + 511) // 512) * 512
-                    # skip non-regular members (dirs have size 0)
-                    while len(buf) < size_pad and not eof:
-                        try:
-                            buf += next(it)
-                        except StopIteration:
-                            eof = True
-                    del buf[:size_pad]
-                    pos += size_pad
-                    need_hdr = True
-                continue
-            data = bytes(buf[:size])
+            name = h[0:100].rstrip(b"\0").decode("utf-8", "replace")
+            prefix = h[345:500].rstrip(b"\0").decode("utf-8", "replace")
+            if prefix:
+                name = prefix + "/" + name
+            sz = h[124:136]
+            size = int.from_bytes(sz[1:], "big") if sz[0] & 0x80 else int(sz.strip(b"\0 ") or b"0", 8)
+            typ = h[156:157]
+            hdr_off = pos
+            del buf[:512]
+            pos += 512
             pad = ((size + 511) // 512) * 512
+            if not fill(pad):
+                raise TruncatedTar(f"tar ended inside member {name!r} at {pos + len(buf)} bytes")
+            data = bytes(buf[:size]) if typ in (b"0", b"\0") else None  # skip dirs etc.
             del buf[:pad]
             pos += pad
-            need_hdr = True
+            if data is None:
+                continue
             if pos > next_log:
                 el = time.time() - t_start
                 self.log(f"  {pos/1e9:.2f} GB streamed, {pos/1e6/el:.0f} MB/s")
@@ -336,64 +441,118 @@ def free_ram_gb():
     return None
 
 
+WORKER_GB = 0.4   # per parse worker: json of the largest traces (~0.25 GB transient) + interpreter/numpy/pyproj
+MAIN_GB = 1.5     # main process: index arrays + region legs + in-flight batches
+
+
 def default_workers():
-    n = max(1, min(8, (os.cpu_count() or 2) - 2))
+    n = max(1, min(4, (os.cpu_count() or 2) - 1))
     ram = free_ram_gb()
-    if ram is not None:  # ~0.25 GB per worker (json of a big trace) + ~1.5 GB for the main process / index
-        n = max(1, min(n, int((ram - 1.5) / 0.25)))
+    if ram is not None:
+        n = max(1, min(n, int((ram - MAIN_GB) / WORKER_GB)))
     return n
+
+
+class PoolFailure(RuntimeError):
+    """A parse worker died (OOM kill, MemoryError while receiving a task, crash) or a batch timed out."""
+
+
+def ordered_pool_map(fn, items, workers, initializer=None, initargs=(), timeout=600, max_tasks_per_child=200):
+    """Yield fn(item) in order using worker processes, with at most 2*workers tasks in flight (bounded memory: the
+    items generator is consumed lazily, unlike ProcessPoolExecutor.map before py3.14).  A dead worker
+    (BrokenProcessPool) or a task slower than `timeout` s raises PoolFailure promptly instead of hanging forever
+    (multiprocessing.Pool.imap waits forever for the result of a task whose worker died)."""
+    kw = {"max_tasks_per_child": max_tasks_per_child} if sys.version_info >= (3, 11) and max_tasks_per_child else {}
+    ex = ProcessPoolExecutor(workers, initializer=initializer, initargs=initargs, **kw)
+    q = deque()
+    ok = False
+    try:
+        for it in items:
+            q.append(ex.submit(fn, it))
+            while len(q) >= 2 * workers:
+                yield _result(q.popleft(), timeout)
+        while q:
+            yield _result(q.popleft(), timeout)
+        ok = True
+    finally:
+        if ok:
+            ex.shutdown(wait=True)
+        else:  # error, timeout or the consumer stopped early: do not wait for (possibly hung) workers
+            for f in q:
+                f.cancel()
+            procs = list((getattr(ex, "_processes", None) or {}).values())
+            ex.shutdown(wait=False, cancel_futures=True)
+            for p in procs:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+
+def _result(fut, timeout):
+    from concurrent.futures import TimeoutError as FTimeout
+    from concurrent.futures.process import BrokenProcessPool
+    try:
+        return fut.result(timeout=timeout)
+    except BrokenProcessPool as e:
+        raise PoolFailure(f"a parse worker died ({e}); out of memory? retry with fewer --workers") from e
+    except FTimeout as e:
+        raise PoolFailure(f"a parse batch took more than {timeout} s") from e
 
 
 def stream_day(session, day, feed, bbox, t0, t1, cache, log, keep_ground, workers=None, process=None):
     """Stream one day/feed once and write its byte-offset index to the cache.
-    Memory is bounded: at most 2*workers batches (64 members) are in flight; the index is kept packed.
+    Memory is bounded: at most 2*workers batches (64 members) are in flight (ordered_pool_map); the index is packed.
+    A dead/hung worker or a truncated download raises (PoolFailure / TruncatedTar) instead of hanging or indexing a
+    short day.
     process: optional module-level replacement for _process_batch (same return shape), e.g. ref/data/daily_job.py.
     Also writes <tag>.counts.json (trace count + size), the partial-day reference that survives deleting the index."""
     workers = workers or default_workers()
     tag = tag_for(day, feed)
-    parts = part_urls(day, feed, session)
+    parts, release, repo = find_release(day, feed, session)
     resolved = [resolve(session, u) for u, _ in parts]
-    log(f"{tag}: streaming {len(parts)} part(s), {sum(s for _, s in resolved)/1e9:.2f} GB")
+    sizes = [rs for _, rs in resolved]
+    for (u, s_api), s_head in zip(parts, sizes):
+        if s_api and s_api != s_head:
+            raise IncompleteRelease(f"{u}: API says {s_api} bytes, download is {s_head} (asset being replaced?)")
+    log(f"{tag}: streaming {len(parts)} part(s) of {release} (globe_history_{repo}), {sum(sizes)/1e9:.2f} GB")
     traces, cells, found = [], {}, []
     n_bad = 0
-    # Pool.imap's feeder thread would otherwise pull the whole tar into its task queue when parsing is slower
-    # than the download (the MemoryError seen under RAM pressure): gate the producer with a semaphore.
-    inflight = threading.BoundedSemaphore(2 * workers)
 
     def batches():
         b = []
-        for off, name, data in TarStreamer(session, [u for u, _ in resolved], log).members():
+        # original github.com URLs (each (re)connect follows the redirect: a fresh signed URL for Range resumes)
+        for off, name, data in TarStreamer(session, [(u, sz) for (u, _), sz in zip(parts, sizes)], log).members():
             if "trace_full_" in name:
                 b.append((off, data))
                 if len(b) >= 64:
-                    inflight.acquire()
                     yield b
                     b = []
         if b:
-            inflight.acquire()
             yield b
 
     ram = free_ram_gb()
     log(f"  {workers} parse workers (free RAM {ram if ram is not None else float('nan'):.1f} GB)")
-    with mp.Pool(workers, initializer=_init_worker, initargs=(bbox, t0, t1, keep_ground)) as pool:
-        for res in pool.imap(process or _process_batch, batches(), chunksize=1):
-            inflight.release()
-            for off, size, light, fp, legs in res:
-                if light is None:
-                    n_bad += 1
-                    continue
-                ti = len(traces)
-                traces.append([light["icao"], off, size, light.get("t")])
-                for c, (a, b, m) in fp.items():
-                    arr = cells.get(c)
-                    if arr is None:
-                        arr = cells[c] = array("q")
-                    arr.extend((ti, a, b, m))   # packed: ~32 B per (trace, cell)
-                if legs:
-                    found.append((light, legs))
+    for res in ordered_pool_map(process or _process_batch, batches(), workers, _init_worker,
+                                (bbox, t0, t1, keep_ground)):
+        for off, size, light, fp, legs in res:
+            if light is None:
+                n_bad += 1
+                continue
+            ti = len(traces)
+            traces.append([light["icao"], off, size, light.get("t")])
+            for c, (a, b, m) in fp.items():
+                arr = cells.get(c)
+                if arr is None:
+                    arr = cells[c] = array("q")
+                arr.extend((ti, a, b, m))   # packed: ~32 B per (trace, cell)
+            if legs:
+                found.append((light, legs))
+        del res
     head = {"tag": tag, "day": str(day), "day0": int(dt.datetime(day.year, day.month, day.day,
                                                                 tzinfo=dt.timezone.utc).timestamp()),
-            "cell_deg": CELL, "parts": [[u, s] for (u, _), (_, s) in zip(parts, resolved)],
+            "cell_deg": CELL, "release": release, "repo": f"globe_history_{repo}",
+            "parts": [[u, s] for (u, _), s in zip(parts, sizes)],
             "n_bad_members": n_bad, "traces": traces}
     os.makedirs(cache, exist_ok=True)
     p = os.path.join(cache, f"{tag}.idx.json.gz")
@@ -404,7 +563,7 @@ def stream_day(session, day, feed, bbox, t0, t1, cache, log, keep_ground, worker
         f.write("}}")
     os.replace(p + ".tmp", p)
     with open(os.path.join(cache, f"{tag}.counts.json"), "w", encoding="utf-8") as f:
-        json.dump({"n_traces": len(traces), "bytes": sum(s for _, s in resolved)}, f)
+        json.dump({"n_traces": len(traces), "bytes": sum(sizes)}, f)
     log(f"{tag}: indexed {len(traces)} traces -> {p} ({os.path.getsize(p)/1e6:.1f} MB)"
         + (f", {n_bad} unreadable members" if n_bad else ""))
     return found
@@ -479,15 +638,15 @@ def to_contract(found, types, geoid, max_alt_m):
     allpts = [q for _, legs in found for leg in legs for q in leg]
     if not allpts:
         return [], {"alt_src": {}, "baro_offset_median_m": None, "n_cal_pairs": 0}
-    lat = np.array([q["lat"] for q in allpts])
-    lon = np.array([q["lon"] for q in allpts])
-    N = geoid.N(lat, lon)
+    lat = np.array([q.lat for q in allpts])
+    lon = np.array([q.lon for q in allpts])
+    N = np.asarray(geoid.N(lat, lon), float).tolist()  # same order as allpts (consumed in the loop below)
+    del lat, lon
     pairs_t, pairs_d = [], []
     for q, n in zip(allpts, N):
-        q["N"] = float(n)
-        if q["geom"] is not None and q["baro"] is not None and q["baro"] < CAL_MAX_BARO_FT:
-            pairs_t.append(q["t"])
-            pairs_d.append(q["geom"] * FT - n - q["baro"] * FT)
+        if q.geom is not None and q.baro is not None and q.baro < CAL_MAX_BARO_FT:
+            pairs_t.append(q.t)
+            pairs_d.append(q.geom * FT - n - q.baro * FT)
     pairs_t = np.array(pairs_t)
     pairs_d = np.array(pairs_d)
     order = np.argsort(pairs_t)
@@ -501,6 +660,8 @@ def to_contract(found, types, geoid, max_alt_m):
             return float(np.median(pairs_d))
         return float(np.median(pairs_d[i0:i1]))
 
+    del allpts
+    nit = iter(N)
     off_cache = {}
     tracks, stats = [], {"alt_src": {"geom": 0, "baro_cal": 0, "baro_raw": 0, "ground": 0}}
     for d, legs in found:
@@ -513,32 +674,33 @@ def to_contract(found, types, geoid, max_alt_m):
         for leg in legs:
             pts, srcs, vel = [], set(), []
             for q in leg:
-                if q["ground"]:
+                n = next(nit)
+                if q.ground:
                     alt = None  # on ground: no altitude; caller adds DEM if needed
                     stats["alt_src"]["ground"] += 1
-                elif q["geom"] is not None:
-                    alt = q["geom"] * FT - q["N"]
+                elif q.geom is not None:
+                    alt = q.geom * FT - n
                     stats["alt_src"]["geom"] += 1
                 else:
-                    k = int(q["t"] // 300)
+                    k = int(q.t // 300)
                     if k not in off_cache:
-                        off_cache[k] = baro_offset(q["t"])
+                        off_cache[k] = baro_offset(q.t)
                     o = off_cache[k]
-                    alt = q["baro"] * FT + (o or 0.0)
+                    alt = q.baro * FT + (o or 0.0)
                     stats["alt_src"]["baro_cal" if o is not None else "baro_raw"] += 1
                 if alt is None:
                     continue
-                if q["src"]:
-                    srcs.add(q["src"])
-                pts.append([round(q["t"], 2), round(q["lat"], 6), round(q["lon"], 6), round(alt, 1)])
-                g, tk, v = q.get("gs"), q.get("trk"), q.get("vr")
+                if q.src:
+                    srcs.add(q.src)
+                pts.append([round(q.t, 2), round(q.lat, 6), round(q.lon, 6), round(alt, 1)])
+                g, tk, v = q.gs, q.trk, q.vr
                 vel.append([round(g * 0.514444, 2) if g is not None else None, round(tk, 1) if tk is not None else None,
                             round(v * 0.00508, 2) if v is not None else None])
             if len(pts) < 2:
                 continue
             if max_alt_m is not None and min(p[3] for p in pts) > max_alt_m:
                 continue
-            cs = next((q["cs"] for q in reversed(leg) if q["cs"]), None)
+            cs = next((q.cs for q in reversed(leg) if q.cs), None)
             tracks.append({"id": f"{icao}_{int(pts[0][0])}", "icao24": icao, "callsign": cs, "type": typ,
                            "category": cat, "points": pts,
                            # extras (not in contract, ignorable)
@@ -808,7 +970,7 @@ def fetch(bbox, t0, t1, feeds=("prod", "mlatonly"), cache=DEFAULT_CACHE, max_alt
                 st = day_status(day, feed, n, size, cache)
             except MissingRelease as e:
                 old = day < dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=2)
-                if old and not os.path.exists(miss):  # remember it, don't ask GitHub again
+                if old and not os.path.exists(miss) and not isinstance(e, IncompleteRelease):  # don't ask again
                     os.makedirs(cache, exist_ok=True)
                     with open(miss, "w", encoding="utf-8") as f:
                         f.write(str(e))

@@ -22,7 +22,7 @@ import sys
 
 os.environ.setdefault("PROJ_NETWORK", "ON")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fetch_adsb import CELL, DEFAULT_CACHE, Geoid, cells_for_bbox, day_status  # noqa: E402
+from fetch_adsb import CELL, DEFAULT_CACHE, LICENSE, Geoid, cells_for_bbox, day_status, feed_of_tag  # noqa: E402
 
 
 def main(argv=None):
@@ -35,9 +35,9 @@ def main(argv=None):
     if a.index.endswith(".missing"):
         tag = os.path.basename(a.index)[:-len(".missing")]
         day = dt.date.fromisoformat(tag[1:11].replace(".", "-"))
-        feed = tag.split("-readsb-")[1].rsplit("-", 1)[0]
+        feed = feed_of_tag(tag)
         with open(a.index, encoding="utf-8") as f:
-            st = day_status(day, feed, 0, 0, a.cache, missing=True, note=f.read().strip())
+            st = {**day_status(day, feed, 0, 0, a.cache, missing=True, note=f.read().strip()), **LICENSE}
         os.makedirs(os.path.join(a.out, tag), exist_ok=True)
         with open(os.path.join(a.out, tag, "day.json"), "w", encoding="utf-8") as f:
             json.dump(st, f)
@@ -47,8 +47,12 @@ def main(argv=None):
         idx = json.load(f)
     tag = idx["tag"]
     day = dt.date.fromisoformat(idx["day"])
-    feed = tag.split("-readsb-")[1].rsplit("-", 1)[0]
+    feed = feed_of_tag(tag)
     st = day_status(day, feed, len(idx["traces"]), sum(sz for _, sz in idx["parts"]), a.cache)
+    # real release tag / repo (may differ from the canonical <tag>: -0tmp/-1 re-runs, Dec 31 in next year's repo):
+    # /adsb/range requests must use these when present
+    rel = {k: idx[k] for k in ("release", "repo") if idx.get(k)}
+    st.update(rel, **LICENSE)
     os.makedirs(os.path.join(a.out, tag), exist_ok=True)
     with open(os.path.join(a.out, tag, "day.json"), "w", encoding="utf-8") as f:
         json.dump(st, f)
@@ -87,8 +91,8 @@ def main(argv=None):
                 skipped += 1
                 continue
             rows.append([icao, typ, loc[0], loc[1], size, tmin, tmax, minalt])
-        sh = {"tag": tag, "cell": ci, "cell_deg": CELL, "geoid_N": round(float(geoid.N([lat], [lon])[0]), 2),
-              "traces": rows}
+        sh = {"tag": tag, **rel, "cell": ci, "cell_deg": CELL,
+              "geoid_N": round(float(geoid.N([lat], [lon])[0]), 2), **LICENSE, "traces": rows}
         p = os.path.join(a.out, tag, f"{ci}.json")
         with open(p, "w", encoding="utf-8") as f:
             json.dump(sh, f, separators=(",", ":"))

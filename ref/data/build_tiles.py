@@ -17,7 +17,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fetch_adsb import CELL, DEFAULT_CACHE, cells_for_bbox, fetch  # noqa: E402
+from fetch_adsb import CELL, DEFAULT_CACHE, LICENSE, cells_for_bbox, fetch  # noqa: E402
 
 
 def cell_bbox(c):
@@ -48,7 +48,7 @@ def main(argv=None):
             p = os.path.join(a.out, day, f"{c}.json.gz")
             with gzip.open(p, "wt", encoding="utf-8", compresslevel=9) as f:
                 json.dump({"date": day, "cell": c, "cell_deg": CELL, "source": "adsb.lol globe_history (ODbL 1.0)",
-                           "tracks": tracks}, f, separators=(",", ":"))
+                           **LICENSE, "tracks": tracks}, f, separators=(",", ":"))
             print(f"{day} cell {c}: {len(tracks)} non-jet tracks, {sum(len(x['points']) for x in tracks)} pts, "
                   f"{os.path.getsize(p)/1e3:.0f} KB gz, built in {time.time()-t:.1f}s")
 
