@@ -22,7 +22,7 @@ import sys
 
 os.environ.setdefault("PROJ_NETWORK", "ON")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fetch_adsb import CELL, DEFAULT_CACHE, LICENSE, Geoid, cells_for_bbox, day_status, feed_of_tag  # noqa: E402
+from fetch_adsb import CELL, DEFAULT_CACHE, LICENSE, Geoid, cells_for_bbox, corruption_status, day_status, feed_of_tag  # noqa: E402
 
 
 def main(argv=None):
@@ -48,7 +48,10 @@ def main(argv=None):
     tag = idx["tag"]
     day = dt.date.fromisoformat(idx["day"])
     feed = feed_of_tag(tag)
-    st = day_status(day, feed, len(idx["traces"]), sum(sz for _, sz in idx["parts"]), a.cache)
+    size = sum(sz for _, sz in idx["parts"])
+    st = day_status(day, feed, len(idx["traces"]), size, a.cache)
+    st = corruption_status(st, len(idx["traces"]), idx.get("n_corrupt", 0), idx.get("tar_skipped_bytes", 0), size,
+                           idx.get("tar_resync_failed", False))
     # real release tag / repo (may differ from the canonical <tag>: -0tmp/-1 re-runs, Dec 31 in next year's repo):
     # /adsb/range requests must use these when present
     rel = {k: idx[k] for k in ("release", "repo") if idx.get(k)}

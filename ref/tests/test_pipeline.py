@@ -140,8 +140,9 @@ def test_tar_complete_and_truncated():
 
 # ----------------------------------------------------------------- P4: resume
 class _Resp:
-    def __init__(self, data, status=200, fail_after=None):
+    def __init__(self, data, status=200, fail_after=None, headers=None):
         self.data, self.status_code, self.fail_after = data, status, fail_after
+        self.headers = headers or {}
 
     def __enter__(self):
         return self
@@ -161,14 +162,19 @@ class _Resp:
 
 
 class _DropSession:
-    def __init__(self, data, drops):
-        self.data, self.drops, self.ranges = data, drops, []
+    def __init__(self, data, drops, http5xx=0, cr_shift=0):
+        self.data, self.drops, self.ranges, self.http5xx, self.cr_shift = data, drops, [], http5xx, cr_shift
 
     def get(self, url, stream=True, timeout=None, headers=None):
         start = int(headers["Range"][6:-1]) if headers and "Range" in headers else 0
         self.ranges.append(start)
+        if start and self.http5xx:
+            self.http5xx -= 1
+            return _Resp(b"", 503)
         fail = 3000 if len(self.ranges) <= self.drops else None
-        return _Resp(self.data[start:], 206 if start else 200, fail)
+        n = len(self.data)
+        cr = {"Content-Range": f"bytes {start + self.cr_shift}-{n - 1}/{n}"} if start else {}
+        return _Resp(self.data[start:], 206 if start else 200, fail, cr)
 
 
 def test_resume_dropped_download():
@@ -179,6 +185,108 @@ def test_resume_dropped_download():
     with pytest.raises(fa.TruncatedTar, match="dropped"):
         big = _tar_bytes([_member("a%05d" % i, [(41.5, 2.1)] * 30) for i in range(80)])
         list(fa.TarStreamer(_DropSession(big, drops=10), [("u", len(big))], lambda *a: None).members())
+
+
+def test_resume_retries_5xx_and_checks_content_range(monkeypatch):
+    monkeypatch.setattr(fa.time, "sleep", lambda s: None)
+    data = _tar_bytes([_member("a%05d" % i, [(41.5, 2.1)] * 30) for i in range(8)])
+    s = _DropSession(data, drops=1, http5xx=1)  # drop, then a 503 on the first resume, then OK
+    assert len(list(fa.TarStreamer(s, [("u", len(data))], lambda *a: None).members())) == 8
+    assert len(s.ranges) == 3
+    with pytest.raises(fa.TruncatedTar, match="Content-Range"):  # 206 for the wrong offset
+        list(fa.TarStreamer(_DropSession(data, drops=1, cr_shift=512), [("u", len(data))], lambda *a: None).members())
+
+
+# ----------------------------------------------------------------- F13: corrupt upstream releases
+def _corrupt_split(n=40, garbage=64000, at=20):
+    """Like v2026.05.04/04.30-prod: member `at` is cut by a foreign .tar.ab (its gzip body turns to garbage), then
+    `garbage` random bytes, then valid members again (512-aligned).  Returns (data, n_good_members_after)."""
+    import random as _r
+    rnd = _r.Random(1)
+    good = [_member("a%05d" % i, [(41.5, 2.1)] * 30) for i in range(n)]
+    data = _tar_bytes(good)
+    offs = [o for o, _, _ in _BytesStreamer(data).members()]
+    cut = offs[at] + 100                                     # inside member `at`'s data
+    resume = offs[at + 3] - 512                              # header of member at+3
+    junk = bytes(rnd.randrange(256) for _ in range(garbage))
+    return data[:cut] + junk + data[resume:], n - (at + 3)
+
+
+def test_corrupt_gz_member_is_counted_not_fatal():
+    import zlib
+    good = _member("abc001", [(41.5, 2.1)] * 50)[1]
+    bad = good[:10] + bytes([0xfe]) * 40 + good[50:]  # gzip header + garbage deflate (as in v2026.05.04-prod)
+    with pytest.raises(zlib.error):  # not an OSError/ValueError: used to kill the parse worker -> whole day failed
+        gzip.decompress(bad)
+    fa._init_worker((41, 2, 42, 3), 0, 1e10, False)
+    out = fa._process_batch([(0, bad), (1, _member("abc001", [(41.5, 2.1)])[1])])
+    assert out[0][2] is None and out[1][2]["icao"] == "abc001"
+    out = dj.region_batch([(0, bad)])
+    assert out[0][2] is None
+
+
+def test_tar_resync_after_corrupt_header():
+    data, after = _corrupt_split()
+    logs = []
+    ts = _BytesStreamer(data, chunk=777)
+    ts.log = lambda *a: logs.append(a)
+    names = [n for _, n, _ in ts.members()]
+    assert ts.resyncs == 1 and 0 < ts.skipped_bytes < 70000 and not ts.resync_failed
+    assert names[-1].endswith("a00039.json") and len(names) == 20 + 1 + after  # the cut member is yielded (garbage)
+    assert any("resynchronised" in str(x) for x in logs)
+
+
+def test_tar_resync_failure_is_partial_and_big_loss_fails(tmp_path, monkeypatch):
+    good = [_member("a%05d" % i, [(41.5, 2.1)] * 30) for i in range(40)]
+    data = _tar_bytes(good)
+    offs = [o for o, _, _ in _BytesStreamer(data).members()]
+    tail_junk = bytes(range(256)) * 10
+    small = data[:offs[38] - 512] + tail_junk  # last 2 members lost, no valid header after the junk
+    ts = _BytesStreamer(small)
+    assert len(list(ts.members())) == 38 and ts.resync_failed and ts.skipped_bytes == len(tail_junk)
+    # stream_day: publishes as partial (via build_index) when the loss is small ...
+    _patch_bytes(monkeypatch, small)
+    fa.stream_day(None, dt.date(2026, 11, 6), "prod", (41, 2, 42, 3), 0, 1e10, str(tmp_path), lambda *a: None,
+                  False, workers=1)
+    with gzip.open(tmp_path / "v2026.11.06-planes-readsb-prod-0.idx.json.gz", "rt") as f:
+        idx = json.load(f)
+    assert idx["tar_resync_failed"] and len(idx["traces"]) == 38
+    st = fa.corruption_status({"status": "ok"}, 38, idx["n_corrupt"], idx["tar_skipped_bytes"], len(small), True)
+    assert st["status"] == "partial" and "corrupt" in st["note"]
+    # ... and fails when more than 20% of the release is unparseable
+    big = data[:offs[5] - 512] + tail_junk * 40
+    _patch_bytes(monkeypatch, big)
+    with pytest.raises(fa.CorruptTar):
+        fa.stream_day(None, dt.date(2026, 11, 6), "prod", (41, 2, 42, 3), 0, 1e10, str(tmp_path), lambda *a: None,
+                      False, workers=1)
+
+
+def test_corrupt_split_day_publishes_with_n_corrupt(tmp_path, monkeypatch):
+    data, after = _corrupt_split(garbage=3000)  # small loss relative to this tiny synthetic release
+    _patch_bytes(monkeypatch, data)
+    fa.stream_day(None, dt.date(2026, 11, 6), "prod", (41, 2, 42, 3), 0, 1e10, str(tmp_path), lambda *a: None,
+                  False, workers=1)
+    with gzip.open(tmp_path / "v2026.11.06-planes-readsb-prod-0.idx.json.gz", "rt") as f:
+        idx = json.load(f)
+    assert idx["n_corrupt"] == 1 and idx["tar_resyncs"] == 1 and len(idx["traces"]) == 20 + after
+    # 1 of 38 traces lost (> 0.5%) -> partial; a tiny loss stays ok but is recorded
+    assert fa.corruption_status({"status": "ok"}, 37, 1, idx["tar_skipped_bytes"], len(data))["status"] == "partial"
+    st = fa.corruption_status({"status": "ok"}, 100000, 1, 64000, 3_000_000_000)
+    assert st["status"] == "ok" and st["n_corrupt"] == 1
+    assert fa.corruption_status({"status": "ok"}, 10, 0, 0, 10) == {"status": "ok"}
+
+
+def _patch_bytes(monkeypatch, data):
+    monkeypatch.setattr(fa, "find_release", lambda day, feed, s: ([(f"https://x/{_REL}.tar", len(data))], _REL, 2026))
+    monkeypatch.setattr(fa, "resolve", lambda s, u: (u, len(data)))
+    monkeypatch.setattr(fa, "TarStreamer", lambda s, urls, log: _BytesStreamer(data))
+
+
+def test_tar_header_checksum():
+    data = _tar_bytes([_member("a00001", [(41.5, 2.1)])])
+    assert fa.tar_header_ok(data[:512])
+    assert not fa.tar_header_ok(data[:100] + b"X" + data[101:512])
+    assert not fa.tar_header_ok(bytes(512))
 
 
 # ----------------------------------------------------------------- D2/D3/P3/D7: release discovery

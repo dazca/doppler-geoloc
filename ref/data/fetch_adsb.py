@@ -321,6 +321,26 @@ class TruncatedTar(RuntimeError):
     """The tar stream ended mid-member or before the end-of-archive marker (two zero blocks)."""
 
 
+class CorruptTar(TruncatedTar):
+    """Too much of the release could not be parsed (corrupt tar headers, > MAX_TAR_LOSS of its bytes)."""
+
+
+MAX_TAR_LOSS = 0.20      # fraction of a release's bytes lost to tar corruption above which the day fails
+PARTIAL_LOSS = 0.005     # fraction of traces (or bytes) lost to corruption above which a day is "partial"
+
+
+def tar_header_ok(h):
+    """512-byte ustar/v7 header with a valid checksum (unsigned or signed sum, header checksum field as spaces)."""
+    if len(h) < 512:
+        return False
+    try:
+        chk = int(bytes(h[148:156]).strip(b"\0 ") or b"x", 8)
+    except ValueError:
+        return False
+    rest = bytes(h[:148]) + b" " * 8 + bytes(h[156:512])
+    return chk == sum(rest) or chk == sum(b - 256 if b > 127 else b for b in rest)
+
+
 class TarStreamer:
     """Iterate (global_offset, name, data) over the concatenated parts of a split tar.
     urls: [url] or [(url, expected_size or None)].  A dropped download is resumed with a Range request (up to
@@ -331,6 +351,9 @@ class TarStreamer:
     def __init__(self, session, urls, log):
         self.s, self.log = session, log
         self.urls = [u if isinstance(u, (tuple, list)) else (u, None) for u in urls]
+        # corruption accounting (members()): bad headers met, bytes skipped while resynchronising, and whether the
+        # last resync reached the end of the stream without finding another valid header
+        self.resyncs, self.skipped_bytes, self.resync_failed = 0, 0, False
 
     def chunks(self):
         for u, size in self.urls:
@@ -339,9 +362,13 @@ class TarStreamer:
                 hdr = {"Range": f"bytes={got}-"} if got else {}
                 try:
                     with self.s.get(u, stream=True, timeout=120, headers=hdr) as r:
+                        if r.status_code >= 500:  # GitHub / CDN hiccup: retried like a dropped connection
+                            raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
                         r.raise_for_status()
-                        if got and r.status_code != 206:
-                            raise TruncatedTar(f"server ignored the resume Range request for {u}")
+                        if got and (r.status_code != 206 or
+                                    not (r.headers.get("Content-Range") or "").startswith(f"bytes {got}-")):
+                            raise TruncatedTar(f"server did not honour the resume Range request for {u} "
+                                               f"(HTTP {r.status_code}, Content-Range {r.headers.get('Content-Range')!r})")
                         for c in r.iter_content(chunk_size=1 << 22):
                             got += len(c)
                             yield c
@@ -351,6 +378,10 @@ class TarStreamer:
                 except (requests.ConnectionError, requests.Timeout,
                         requests.exceptions.ChunkedEncodingError) as e:
                     err = f"{type(e).__name__}: {e}"
+                except requests.HTTPError as e:
+                    if e.response is None or e.response.status_code < 500:
+                        raise
+                    err = f"HTTP {e.response.status_code}"
                 if resumes >= self.MAX_RESUMES:
                     raise TruncatedTar(f"{u}: download dropped {resumes + 1} times ({err})")
                 resumes += 1
@@ -374,6 +405,31 @@ class TarStreamer:
                     eof = True
             return len(buf) >= n
 
+        def resync():
+            """Drop bytes until buf starts with the next valid ustar header (never the current one).  Returns the
+            number of bytes skipped, or None if the stream ended first (buf is then empty)."""
+            nonlocal buf, pos
+            p0, lo = pos, 1
+            while True:
+                k = buf.find(b"ustar", lo + 257)
+                if k != -1:
+                    hs = k - 257
+                    if fill(hs + 512) and tar_header_ok(buf[hs:hs + 512]):
+                        del buf[:hs]
+                        pos += hs
+                        return pos - p0
+                    lo = hs + 1
+                    continue
+                if eof:
+                    pos += len(buf)
+                    buf.clear()
+                    return None
+                drop = max(0, len(buf) - 1024)  # keep a tail: a header may straddle the next chunk
+                del buf[:drop]
+                pos += drop
+                lo = max(0, lo - drop)
+                fill(len(buf) + (1 << 20))
+
         while True:
             if not fill(512):
                 raise TruncatedTar(f"tar ended at {pos + len(buf)} bytes without the end-of-archive marker")
@@ -382,6 +438,22 @@ class TarStreamer:
                 if not fill(1024) or bytes(buf[512:1024]) != b"\0" * 512:
                     raise TruncatedTar(f"tar ended at {pos + len(buf)} bytes after a single zero block")
                 return
+            if not tar_header_ok(h):
+                # Corrupt / misaligned upstream tar (seen 2026-04-30 and 2026-05-04: the .tar.ab part does not
+                # continue .tar.aa, so the member spanning the split is garbage and the next "header" is random
+                # bytes).  Resynchronise on the next valid ustar header; the caller accounts for the loss.
+                self.resyncs += 1
+                at = pos
+                n = resync()
+                if n is None:
+                    self.skipped_bytes += pos - at
+                    self.resync_failed = True
+                    self.log(f"  corrupt tar header at {at}: no valid header until the end ({(pos - at)/1e6:.1f} MB "
+                             f"unparsed)")
+                    return
+                self.skipped_bytes += n
+                self.log(f"  corrupt tar header at {at}: resynchronised {n} bytes later")
+                continue
             name = h[0:100].rstrip(b"\0").decode("utf-8", "replace")
             prefix = h[345:500].rstrip(b"\0").decode("utf-8", "replace")
             if prefix:
@@ -425,8 +497,8 @@ def _process_batch(batch):
     for off, data in batch:
         try:
             d = json.loads(gzip.decompress(data) if data[:2] == b"\x1f\x8b" else data)
-        except (ValueError, OSError, MemoryError):
-            out.append((off, len(data), None, None, None))  # unreadable member: counted, not fatal
+        except Exception:  # noqa: BLE001 - zlib.error / EOFError / bad JSON: counted, not fatal
+            out.append((off, len(data), None, None, None))
             continue
         legs = extract(d, _W["bbox"], _W["t0"], _W["t1"], _W["keep_ground"])
         out.append((off, len(data), light_of(d), footprint(d), legs))
@@ -539,10 +611,12 @@ def stream_day(session, day, feed, bbox, t0, t1, cache, log, keep_ground, worker
     traces, cells, found = [], {}, []
     n_bad = 0
 
+    # original github.com URLs (each (re)connect follows the redirect: a fresh signed URL for Range resumes)
+    ts = TarStreamer(session, [(u, sz) for (u, _), sz in zip(parts, sizes)], log)
+
     def batches():
         b = []
-        # original github.com URLs (each (re)connect follows the redirect: a fresh signed URL for Range resumes)
-        for off, name, data in TarStreamer(session, [(u, sz) for (u, _), sz in zip(parts, sizes)], log).members():
+        for off, name, data in ts.members():
             if "trace_full_" in name:
                 b.append((off, data))
                 if len(b) >= 64:
@@ -569,11 +643,16 @@ def stream_day(session, day, feed, bbox, t0, t1, cache, log, keep_ground, worker
             if legs:
                 found.append((light, legs))
         del res
+    total = sum(sizes) or 1
+    if ts.skipped_bytes > MAX_TAR_LOSS * total:
+        raise CorruptTar(f"{release}: {ts.skipped_bytes/1e6:.0f} MB of {total/1e6:.0f} MB unparseable "
+                         f"({ts.resyncs} corrupt tar header(s)); more than {MAX_TAR_LOSS:.0%}, not publishing")
     head = {"tag": tag, "day": str(day), "day0": int(dt.datetime(day.year, day.month, day.day,
                                                                 tzinfo=dt.timezone.utc).timestamp()),
             "cell_deg": CELL, "release": release, "repo": f"globe_history_{repo}",
             "parts": [[u, s] for (u, _), s in zip(parts, sizes)],
-            "n_bad_members": n_bad, "traces": traces}
+            "n_bad_members": n_bad, "n_corrupt": n_bad, "tar_resyncs": ts.resyncs,
+            "tar_skipped_bytes": ts.skipped_bytes, "tar_resync_failed": ts.resync_failed, "traces": traces}
     os.makedirs(cache, exist_ok=True)
     p = os.path.join(cache, f"{tag}.idx.json.gz")
     with gzip.open(p + ".tmp", "wt", encoding="utf-8") as f:  # cells written one by one (no giant list copy)
@@ -585,7 +664,8 @@ def stream_day(session, day, feed, bbox, t0, t1, cache, log, keep_ground, worker
     with open(os.path.join(cache, f"{tag}.counts.json"), "w", encoding="utf-8") as f:
         json.dump({"n_traces": len(traces), "bytes": sum(sizes)}, f)
     log(f"{tag}: indexed {len(traces)} traces -> {p} ({os.path.getsize(p)/1e6:.1f} MB)"
-        + (f", {n_bad} unreadable members" if n_bad else ""))
+        + (f", {n_bad} unreadable members" if n_bad else "")
+        + (f", {ts.resyncs} corrupt tar header(s) ({ts.skipped_bytes/1e6:.1f} MB skipped)" if ts.resyncs else ""))
     return found
 
 
@@ -819,6 +899,21 @@ def reference_traces(day, feed, cache=DEFAULT_CACHE, window_days=200):
         return None, "no reference"
     xs = [dt.date.fromisoformat(a).toordinal() for a, _ in NOMINAL_PROD_TRACES]
     return float(np.interp(day.toordinal(), xs, [b for _, b in NOMINAL_PROD_TRACES])), "nominal table"
+
+
+def corruption_status(st, n_traces, n_corrupt=0, skipped_bytes=0, size_bytes=0, resync_failed=False):
+    """Fold upstream corruption into a day_status dict: records n_corrupt / tar_skipped_bytes and downgrades "ok" to
+    "partial" if > PARTIAL_LOSS of the traces (or bytes) were lost, or a tar resync never found its way back."""
+    if not (n_corrupt or skipped_bytes or resync_failed):
+        return st
+    st.update(n_corrupt=n_corrupt, tar_skipped_bytes=skipped_bytes)
+    lost = max(n_corrupt / max(1, n_traces + n_corrupt), skipped_bytes / max(1, size_bytes))
+    msg = (f"upstream release corrupt: {n_corrupt} unreadable trace(s), {skipped_bytes/1e6:.1f} MB of tar skipped"
+           + (" (unrecoverable to the end)" if resync_failed else ""))
+    st["note"] = f"{st['note']}; {msg}" if st.get("note") else msg
+    if st.get("status") == "ok" and (lost > PARTIAL_LOSS or resync_failed):
+        st["status"] = "partial"
+    return st
 
 
 def day_status(day, feed, n_traces, size_bytes, cache=DEFAULT_CACHE, missing=False, note=None):

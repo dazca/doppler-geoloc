@@ -89,7 +89,7 @@ def region_batch(batch):
     for off, data in batch:
         try:
             d = json.loads(gzip.decompress(data) if data[:2] == b"\x1f\x8b" else data)
-        except (ValueError, OSError, MemoryError):
+        except Exception:  # noqa: BLE001 - corrupt upstream member (zlib.error, EOFError, bad JSON): counted
             out.append((off, len(data), None, None, None))
             continue
         fp = fa.footprint(d)
