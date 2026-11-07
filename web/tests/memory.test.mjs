@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { StreamResampler, resampleTo, resample, decodeAudioFile, decodeWavStream, decodeMp4Stream, readAudioTrack, adtsHeader,
-  parseASC, makeSink, parseWav, maxFullBytes } from '../engine/audio.js';
+  parseASC, makeSink, parseWav, maxFullBytes, readMediaMeta } from '../engine/audio.js';
 import { decimate, whiten } from '../engine/geoloc/spectro.js';
 import { PcmBlockStore, wavFromBlocks, wavHeader, STORE_RATE } from '../live/recorder.js';
 import { cropRangeError, parseClock } from '../ui/time-utils.js';
@@ -256,4 +256,151 @@ test('B12: track cache evicts in its own transaction and recovers from QuotaExce
   assert.equal(await putTracks('new', [{ id: 'n' }]), true);
   assert.deepEqual([...quotaDb.stores.get('tracks').keys()], ['new']);
   delete globalThis.indexedDB;
+});
+
+// ------------------------------------------------------------------ security L1 + review F6-F9: hostile / unusual MP4 and WAV
+// Crafted ISO-BMFF builders (from the security audit's fuzz harness).
+const be32 = (v) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, v >>> 0); return b; };
+const be16 = (v) => { const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, v); return b; };
+const cat = (...a) => { const o = new Uint8Array(a.reduce((s, x) => s + x.length, 0)); let k = 0; for (const x of a) { o.set(x, k); k += x.length; } return o; };
+const str = (s) => Uint8Array.from(s, (c) => c.charCodeAt(0));
+const box = (type, ...kids) => { const body = cat(...kids); return cat(be32(8 + body.length), str(type), body); };
+function esdsBox(asc = [0x15, 0x88]) {   // AAC LC, 8 kHz, mono
+  const dsi = cat(Uint8Array.of(0x05, asc.length), Uint8Array.from(asc));
+  const dcd = cat(Uint8Array.of(0x04, 13 + dsi.length, 0x40, 0x15, 0, 0, 0), be32(0), be32(0), dsi);
+  return box('esds', be32(0), cat(Uint8Array.of(0x03, 3 + dcd.length, 0, 1, 0), dcd));
+}
+const soundEntry = (fmt, kids = []) => box(fmt, new Uint8Array(6), be16(1), be16(0), be16(0), be32(0), be16(1), be16(16), be16(0), be16(0), be32(8000 << 16), ...kids);
+function moovBox(o) {
+  const mvhd = box('mvhd', be32(0), be32(0), be32(0), be32(1000), be32(1000), new Uint8Array(80));
+  const mdhd = box('mdhd', be32(0), be32(0), be32(0), be32(o.timescale ?? 8000), be32(o.duration ?? 8000), be32(0));
+  const hdlr = box('hdlr', be32(0), be32(0), str('soun'), new Uint8Array(12), Uint8Array.of(0));
+  const stsd = box('stsd', be32(0), be32(1), o.entry || soundEntry('mp4a', [esdsBox()]));
+  const stts = box('stts', be32(0), be32(o.stts.length), ...o.stts.flatMap(([c, d]) => [be32(c), be32(d)]));
+  const stsc = box('stsc', be32(0), be32(o.stsc.length), ...o.stsc.flatMap(([f, p]) => [be32(f), be32(p), be32(1)]));
+  const stsz = box('stsz', be32(0), be32(o.stsz.uni), be32(o.stsz.n), ...(o.stsz.table || []).map(be32));
+  const stco = box('stco', be32(0), be32(o.stco.length), ...o.stco.map(be32));
+  const trak = box('trak', box('mdia', mdhd, hdlr, box('minf', box('stbl', stsd, stts, stsc, stsz, stco))));
+  return box('moov', mvhd, trak);
+}
+const mp4File = (moov, pad = 0) => cat(box('ftyp', str('M4A '), be32(0)), moov, pad ? cat(be32(8 + pad), str('mdat'), new Uint8Array(pad)) : new Uint8Array(0));
+const okTable = (n) => ({ stsz: { uni: 100, n }, stts: [[n, 1024]], stsc: [[1, 1]], stco: Array.from({ length: n }, (_, i) => 2000 + 100 * i), duration: n * 1024 });
+/** fake WebAudio for the ADTS / whole-file paths: 1024 samples per ~107-byte frame */
+function withFakeOAC(fn) {
+  const prev = globalThis.OfflineAudioContext;
+  globalThis.OfflineAudioContext = class {
+    constructor(c, l, r) { this.r = r; }
+    async decodeAudioData(buf) {
+      const n = 1024 * Math.max(1, Math.round(buf.byteLength / 107));
+      return { numberOfChannels: 1, sampleRate: this.r, getChannelData: () => new Float32Array(n) };
+    }
+  };
+  return Promise.resolve().then(fn).finally(() => { globalThis.OfflineAudioContext = prev; });
+}
+const memMB = () => (process.memoryUsage().heapUsed + process.memoryUsage().arrayBuffers) / 1e6;
+async function promptBounded(p, { ms = 2000, mb = 64 } = {}) {
+  const t = performance.now(), m0 = memMB();
+  let err = null;
+  try { await p; } catch (e) { err = e; }
+  assert.ok(performance.now() - t < ms, `took ${performance.now() - t} ms`);
+  assert.ok(memMB() - m0 < mb, `memory grew ${memMB() - m0} MB`);
+  return err;
+}
+
+test('L1: hostile sample tables are rejected promptly with bounded memory (not-streamable)', async () => {
+  const cases = {
+    stsz_4e8: mp4File(moovBox({ ...okTable(1), stsz: { uni: 1, n: 400_000_000 }, stts: [[0xffffffff, 1]], stsc: [[1, 0xffffffff]], stco: [0] })),
+    stsz_table_overrun: mp4File(moovBox({ ...okTable(1), stsz: { uni: 0, n: 5000, table: [100] } }), 1 << 20),
+    stsc_zero_per_chunk: mp4File(moovBox({ ...okTable(5), stsc: [[1, 0], [0xffffffff, 1]] }), 4000),
+    overlapping_samples: mp4File(moovBox({ ...okTable(1100), stsz: { uni: 0xffffffff, n: 1100 }, stco: Array(1100).fill(0) }), 1 << 20),
+    overlap_small: mp4File(moovBox({ ...okTable(1100), stsz: { uni: 900, n: 1100 }, stco: Array(1100).fill(0) }), 1 << 19),
+    beyond_file: mp4File(moovBox({ ...okTable(20), stco: Array(20).fill(0xfffffff0) }), 4000),
+    timescale0: mp4File(moovBox({ ...okTable(20), timescale: 0 }), 4000),
+  };
+  for (const [name, u8] of Object.entries(cases)) {
+    const err = await promptBounded(readAudioTrack(new Blob([u8])));
+    assert.equal(err?.code, 'not-streamable', `${name}: ${err?.message}`);
+    // the public entry point fails with a friendly coded error (too large to read whole), never hangs or allocates GBs
+    const e2 = await promptBounded(withFakeOAC(() => decodeAudioFile(new Blob([u8]), { sampleRate: 8000, readMeta: false, streamBytes: 0, maxBytes: 100 })));
+    assert.equal(e2?.code, 'too-large', name);
+  }
+});
+
+test('L1: a claimed 1 h duration over 20 frames decodes ~3.5 s, not an hour of silence', async () => {
+  const u8 = mp4File(moovBox({ ...okTable(20), timescale: 8000, duration: 3600 * 8000 }), 4000);
+  const err = await promptBounded(withFakeOAC(async () => {
+    const r = await decodeMp4Stream(new Blob([u8]), { sampleRate: 8000, prefer: 'adts' });
+    assert.ok(r.duration < 20 * 1024 / 8000 + 1.01, `duration ${r.duration}`);
+    assert.ok(r.samples.length <= Math.ceil(r.duration * 8000) + 1);
+  }));
+  assert.equal(err, null);
+  // the sink writes long gaps in bounded chunks (no single giant allocation)
+  const sink = makeSink(0, 600, 1000);
+  sink.put(new Float32Array(10), 0, 96000);
+  sink.put(new Float32Array(10), 599, 96000);   // a 599 s gap at 96 kHz = 57.5M samples, written 1M at a time
+  assert.equal(sink.finish().length, 600 * 1000);
+});
+
+test('L1: metadata keys box with a zero-size entry does not loop forever', async () => {
+  const keys = box('keys', be32(0), be32(0xffffffff), be32(0), str('mdta'), new Uint8Array(32));
+  const meta = box('meta', box('hdlr', be32(0), be32(0), str('mdta'), new Uint8Array(12)), keys, box('ilst'));
+  const u8 = mp4File(box('moov', box('udta', meta)));
+  const err = await promptBounded(readMediaMeta(new Blob([u8])));
+  assert.equal(err, null);
+});
+
+test('F6/F8: fragmented MP4 (empty sample table) and MOV LPCM are not streamable -> whole-file fallback, never bad-range', async () => {
+  const frag = mp4File(moovBox({ stsz: { uni: 0, n: 0 }, stts: [], stsc: [], stco: [], duration: 0 }), 4000);
+  const lpcm = mp4File(moovBox({ ...okTable(20), entry: soundEntry('sowt') }), 4000);
+  for (const u8 of [frag, lpcm]) {
+    await assert.rejects(readAudioTrack(new Blob([u8])), (e) => e.code === 'not-streamable');
+    const blob = new Blob([u8]);
+    // crop given: the streaming path is tried first; its failure must fall back (here: too large to read whole)
+    await assert.rejects(decodeAudioFile(blob, { sampleRate: 8000, readMeta: false, crop: [0, 1], maxBytes: 100 }), (e) => e.code === 'too-large');
+    // small enough: the whole-file decoder (fake WebAudio)
+    const r = await withFakeOAC(() => decodeAudioFile(blob, { sampleRate: 8000, readMeta: false, crop: [0, 1] }));
+    assert.equal(r.path, 'whole');
+  }
+});
+
+test('F7: only PCM/float WAV is streamed; other formats fall back to the whole-file decoder', async () => {
+  const blob = wavBytes(new Float32Array(8000), 8000);
+  const u8 = new Uint8Array(await blob.arrayBuffer());
+  new DataView(u8.buffer).setUint16(20, 2, true);             // MS ADPCM
+  await assert.rejects(decodeWavStream(new Blob([u8]), { sampleRate: 8000 }), /cannot be streamed/);
+  await assert.rejects(decodeAudioFile(new Blob([u8]), { sampleRate: 8000, readMeta: false, streamBytes: 0, maxBytes: 100 }), (e) => e.code === 'too-large');
+  const r = await withFakeOAC(() => decodeAudioFile(new Blob([u8]), { sampleRate: 8000, readMeta: false, streamBytes: 0 }));
+  assert.equal(r.path, 'whole');
+});
+
+test('F9: WebCodecs path flushes once at the end and waits on the decode queue', async () => {
+  const u8 = new Uint8Array(readFileSync(DEMO));
+  let flushes = 0, maxQ = 0;
+  const prev = [globalThis.AudioDecoder, globalThis.EncodedAudioChunk];
+  globalThis.EncodedAudioChunk = class { constructor(o) { Object.assign(this, o); } };
+  globalThis.AudioDecoder = class extends EventTarget {
+    static async isConfigSupported() { return { supported: true }; }
+    constructor({ output }) { super(); this.output = output; this.q = []; }
+    configure() {}
+    get decodeQueueSize() { return this.q.length; }
+    decode(c) {
+      this.q.push(c); maxQ = Math.max(maxQ, this.q.length);
+      if (this.q.length === 1) setTimeout(() => this._drain(), 0);
+    }
+    _drain() {
+      for (const c of this.q.splice(0, 16)) this._out(c);
+      this.dispatchEvent(new Event('dequeue'));
+      if (this.q.length) setTimeout(() => this._drain(), 0);
+    }
+    _out(c) { this.output({ numberOfFrames: 1024, numberOfChannels: 1, sampleRate: 8000, timestamp: c.timestamp, copyTo: () => {}, close() {} }); }
+    async flush() { flushes++; for (const c of this.q.splice(0)) this._out(c); }
+    close() {}
+  };
+  try {
+    const r = await decodeMp4Stream(new Blob([u8]), { sampleRate: 8000 });
+    assert.equal(r.path, 'mp4-webcodecs');
+    assert.equal(flushes, 1);
+    assert.ok(maxQ <= 66, `queue grew to ${maxQ}`);
+    assert.ok(Math.abs(r.samples.length / 8000 - r.duration) < 0.5);
+  } finally { [globalThis.AudioDecoder, globalThis.EncodedAudioChunk] = prev; }
 });

@@ -4,7 +4,7 @@
 import * as Engine from './engine.js';
 import { createSpecPanel, stftOptions, ridgeOptions, budgetHop, PRESETS, DECODE_RATE } from './spec-panel.js';
 import { createMapPanel, makeRegion, regionBBox, regionAreaKm2, regionPolygon, CAT_COLORS } from './map-panel.js';
-import { decodeAudioFile, readMediaMeta } from '../engine/audio.js';
+import { decodeAudioFile, readMediaMeta, readAudioTrack } from '../engine/audio.js';
 import * as T from './time-utils.js';
 import * as X from './export.js';
 import * as Store from './store.js';
@@ -204,20 +204,23 @@ async function loadMedia(file, { demo = null, keepProject = false, forceRange = 
     renderAll();
   }
   R.decoding = true;
-  spec.setSource(null);
-  R.runAbort?.abort(); R.detectAbort?.abort();
   try {
     busy(t('busy.read', { name: file.name }), null);
     const meta = await readMediaMeta(file).catch(() => null);
     const estDur = meta?.durationSec || await probeDuration(file);
     let crop = (same || keepProject) && P.media?.crop ? P.media.crop : null;
-    const streamable = meta?.container === 'isobmff' || /\.wav$/i.test(file.name || '');
+    // streamable = decodeAudioFile can stream it: an MP4/MOV only if its moov has an AAC sample table we can read
+    // (LPCM / other codecs / fragmented MP4 are decoded whole, which the memory estimate must know)
+    const streamable = meta?.container === 'isobmff' ? await readAudioTrack(file).then(() => true, () => false)
+      : /\.wav$/i.test(file.name || '');
     if (forceRange || (!crop && isLarge(file, estDur, streamable))) {
       busy(null);
       const choice = await askLargeFile(file, estDur, crop, streamable);
       if (!choice) { renderMedia(); return; }
       crop = choice.crop;
     }
+    // only now (the large-file dialog was confirmed, or not needed) stop the previous recording's running work
+    R.runAbort?.abort(); R.detectAbort?.abort();
     releaseMedia();                      // B4: the previous recording's buffers go before the new decode starts
     busy(t('busy.decode'), null);
     const t0 = performance.now();
@@ -226,7 +229,8 @@ async function loadMedia(file, { demo = null, keepProject = false, forceRange = 
       dec = await decodeAudioFile(file, { sampleRate: DECODE_RATE, readMeta: false, crop, onProgress: (p) => busy(t('busy.decode'), p),
         ...(QS.has('stream') ? { streamBytes: 0 } : {}) });
     } catch (e) {
-      R.file = null; resetSpecUi();
+      // the previous recording is already released: show the empty state rather than its stale name/duration
+      R.file = null; P.media = null; resetSpecUi();
       throw new Error(audioErrorText(e, file) || e?.message || String(e));
     }
     const decodeMs = performance.now() - t0;

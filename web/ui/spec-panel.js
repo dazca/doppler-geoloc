@@ -116,8 +116,10 @@ export function createSpecPanel(host, { onPick, onBox, onHover, onView } = {}) {
       if (!spec) return Promise.reject(new Error('No spectrogram'));
       if (signal?.aborted) return Promise.reject(new DOMException('Detection cancelled', 'AbortError'));
       const p = trackCall({ type: 'autodetect', opts }, onProgress);
-      signal?.addEventListener('abort', () => dropTracker(new DOMException('Detection cancelled', 'AbortError')), { once: true });
-      return p;
+      if (!signal) return p;
+      const onAbort = () => dropTracker(new DOMException('Detection cancelled', 'AbortError'));
+      signal.addEventListener('abort', onAbort, { once: true });
+      return p.finally(() => signal.removeEventListener('abort', onAbort));   // a later abort must not kill a new run
     },
     /** Reference spectrogram + its whitened copy for scoring, computed in the DSP worker (B11). */
     reference(samples, fs) { dsp ||= createDspClient(); return dsp.refspec(samples, fs); },

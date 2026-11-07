@@ -303,6 +303,12 @@ function pcmToMono(u8, { format, channels, bits }, out) {
 export async function decodeWavStream(file, { sampleRate = 8000, crop = null, onProgress, blockBytes = 4 << 20 } = {}) {
   const read = makeReader(file), size = sourceSize(file);
   const hd = parseWavHeader(await read(0, 1 << 20), size);
+  // only integer PCM / IEEE float can be converted here; anything else (ADPCM, mu-law, ...) falls back to the
+  // browser's whole-file decoder (decodeAudioFile catches this plain Error)
+  const okBits = hd.format === 1 ? [8, 16, 24, 32] : hd.format === 3 ? [32, 64] : [];
+  if (!okBits.includes(hd.bits) || !(hd.channels >= 1 && hd.channels <= 64) || !(hd.sampleRate >= 1000 && hd.sampleRate <= 768000)) {
+    throw new Error(`WAV format ${hd.format} / ${hd.bits} bit / ${hd.channels} ch / ${hd.sampleRate} Hz cannot be streamed`);
+  }
   const align = hd.channels * hd.bits / 8, total = Math.floor(hd.dataLen / align), duration = total / hd.sampleRate;
   const a = crop ? Math.max(0, Math.floor(crop[0] * hd.sampleRate)) : 0, b = crop ? Math.min(total, Math.ceil(crop[1] * hd.sampleRate)) : total;
   if (!(b > a)) throw audioError('bad-range', 'The chosen range is outside the recording.');
@@ -360,12 +366,18 @@ function readEsds(u8, b) {
   throw new Error('esds without AudioSpecificConfig');
 }
 
+/** Most samples a sample table may declare (AAC at 48 kHz: ~47 frames/s -> > 100 h). Bounds the table arrays. */
+export const MAX_TRACK_SAMPLES = 20e6;
+
 /**
- * Sample table of the first AAC sound track of a moov box (u8 = moov body).
+ * Sample table of the first AAC sound track of a moov box (u8 = moov body; fileSize = size of the whole file).
  * -> {timescale, duration (s), mediaTime (media units), delay (s), asc, aot, sfi, sampleRate, channels, n,
  *     offset: Float64Array (file offsets), size: Uint32Array, dts: Float64Array (media units)}
+ * Hostile tables are rejected before any big allocation (audioError 'not-streamable': the caller falls back): sample
+ * counts beyond the file / MAX_TRACK_SAMPLES or beyond their box, samples outside the file or overlapping (their
+ * sizes summing to more than the file). An empty table (fragmented MP4: samples live in moof boxes) is not streamable.
  */
-export function parseAudioTrack(u8) {
+export function parseAudioTrack(u8, fileSize = Infinity) {
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   const kid = (b, t) => (b ? boxes(u8, b.body, b.end).find((k) => k.type === t) : undefined);
   const top = boxes(u8, 0, u8.length);
@@ -376,9 +388,10 @@ export function parseAudioTrack(u8) {
     const mdia = kid(trak, 'mdia'), hdlr = kid(mdia, 'hdlr');
     if (!hdlr || fourcc(u8, hdlr.body + 8) !== 'soun') continue;
     const mdhd = kid(mdia, 'mdhd'), v1 = u8[mdhd.body] === 1;
+    if (!mdhd) continue;
     const timescale = dv.getUint32(mdhd.body + (v1 ? 20 : 12)), duration = v1 ? u64(dv, mdhd.body + 24) : dv.getUint32(mdhd.body + 16);
     const stbl = kid(kid(mdia, 'minf'), 'stbl'), stsd = kid(stbl, 'stsd');
-    if (!stsd) continue;
+    if (!stsd || stsd.end - stsd.body < 16) continue;
     const ent = stsd.body + 8, fmt = fourcc(u8, ent + 4);
     codecSeen = fmt;
     if (fmt !== 'mp4a') continue;
@@ -387,6 +400,10 @@ export function parseAudioTrack(u8) {
     const esds = kids.find((k) => k.type === 'esds') || kid(kids.find((k) => k.type === 'wave'), 'esds');
     if (!esds) throw new Error('mp4a track without esds');
     const asc = readEsds(u8, esds), cfg = parseASC(asc);
+    if (!timescale) throw notStreamable('audio track timescale is 0');
+    if (!(cfg.sampleRate >= 1000 && cfg.sampleRate <= 768000) || !(cfg.channels >= 1 && cfg.channels <= 8)) {
+      throw notStreamable(`unsupported AAC configuration (${cfg.sampleRate} Hz, ${cfg.channels} ch)`);
+    }
     // edit list: empty edits delay the track, the first real edit's media_time skips the encoder priming
     let mediaTime = 0, delay = 0;
     const elst = kid(kid(trak, 'edts'), 'elst');
@@ -398,26 +415,44 @@ export function parseAudioTrack(u8) {
         mediaTime = mt; break;
       }
     }
-    const stsz = kid(stbl, 'stsz');
-    if (!stsz) throw new Error('no stsz (compact stz2 sample sizes are not supported)');
-    const uni = dv.getUint32(stsz.body + 4), n = dv.getUint32(stsz.body + 8), size = new Uint32Array(n);
-    for (let i = 0; i < n; i++) size[i] = uni || dv.getUint32(stsz.body + 12 + 4 * i);
-    const stts = kid(stbl, 'stts'), dts = new Float64Array(n);
-    { let s = 0, t = 0; const cnt = dv.getUint32(stts.body + 4);
-      for (let e = 0; e < cnt && s < n; e++) { const c = dv.getUint32(stts.body + 8 + 8 * e), d = dv.getUint32(stts.body + 12 + 8 * e); for (let k = 0; k < c && s < n; k++) { dts[s++] = t; t += d; } } }
+    const stsz = kid(stbl, 'stsz'), stts = kid(stbl, 'stts'), stsc = kid(stbl, 'stsc');
     const stco = kid(stbl, 'stco'), co64 = kid(stbl, 'co64'), cb = stco || co64;
-    const nCh = dv.getUint32(cb.body + 4), chunkOff = new Float64Array(nCh);
+    if (!stsz) throw notStreamable('no stsz (compact stz2 sample sizes are not supported)');
+    if (!stts || !stsc || !cb || [stsz, stts, stsc, cb].some((b) => b.end - b.body < 8)) throw notStreamable('incomplete sample table');
+    const uni = dv.getUint32(stsz.body + 4), n = stsz.end - stsz.body >= 12 ? dv.getUint32(stsz.body + 8) : 0;
+    if (!n) throw notStreamable('empty sample table (fragmented MP4?)');
+    if (n > MAX_TRACK_SAMPLES || n > fileSize || (uni && n * uni > fileSize)) throw notStreamable(`sample table claims ${n} samples`);
+    if (!uni && stsz.body + 12 + 4 * n > stsz.end) throw notStreamable('stsz table overruns its box');
+    const size = new Uint32Array(n);
+    let total = 0;
+    for (let i = 0; i < n; i++) { size[i] = uni || dv.getUint32(stsz.body + 12 + 4 * i); total += size[i]; }
+    if (total > fileSize) throw notStreamable('sample sizes add up to more than the file');
+    const dts = new Float64Array(n);
+    { let s = 0, t = 0; const cnt = Math.min(dv.getUint32(stts.body + 4), Math.floor((stts.end - stts.body - 8) / 8));
+      for (let e = 0; e < cnt && s < n; e++) { const c = dv.getUint32(stts.body + 8 + 8 * e), d = dv.getUint32(stts.body + 12 + 8 * e); for (let k = 0; k < c && s < n; k++) { dts[s++] = t; t += d; } }
+      for (; s < n; s++) dts[s] = t; }
+    const nCh = Math.min(dv.getUint32(cb.body + 4), Math.floor((cb.end - cb.body - 8) / (co64 ? 8 : 4)), n), chunkOff = new Float64Array(nCh);
     for (let i = 0; i < nCh; i++) chunkOff[i] = co64 ? u64(dv, cb.body + 8 + 8 * i) : dv.getUint32(cb.body + 8 + 4 * i);
-    const stsc = kid(stbl, 'stsc'), nE = dv.getUint32(stsc.body + 4), offset = new Float64Array(n);
-    for (let e = 0, s = 0; e < nE; e++) {
-      const first = dv.getUint32(stsc.body + 8 + 12 * e) - 1, per = dv.getUint32(stsc.body + 12 + 12 * e);
-      const next = e + 1 < nE ? dv.getUint32(stsc.body + 20 + 12 * e) - 1 : nCh;
-      for (let c = first; c < next && s < n; c++) { let o = chunkOff[c]; for (let k = 0; k < per && s < n; k++, s++) { offset[s] = o; o += size[s]; } }
+    const nE = Math.min(dv.getUint32(stsc.body + 4), Math.floor((stsc.end - stsc.body - 8) / 12)), offset = new Float64Array(n);
+    let s = 0;
+    for (let e = 0; e < nE && s < n; e++) {
+      const first = Math.max(0, dv.getUint32(stsc.body + 8 + 12 * e) - 1), per = dv.getUint32(stsc.body + 12 + 12 * e);
+      if (!per) continue;                                        // 0 samples per chunk: nothing to place
+      const next = Math.min(nCh, e + 1 < nE ? Math.max(0, dv.getUint32(stsc.body + 20 + 12 * e) - 1) : nCh);
+      for (let c = first; c < next && s < n; c++) {
+        let o = chunkOff[c];
+        for (let k = 0; k < per && s < n; k++, s++) {
+          if (o + size[s] > fileSize) throw notStreamable(`sample ${s} lies outside the file`);
+          offset[s] = o; o += size[s];
+        }
+      }
     }
+    if (s < n) throw notStreamable(`sample table places only ${s} of ${n} samples`);
     return { timescale, duration: duration / timescale, mediaTime, delay, asc, ...cfg, n, offset, size, dts };
   }
-  throw new Error(codecSeen ? `audio codec "${codecSeen}" cannot be streamed (only AAC)` : 'no audio track');
+  throw notStreamable(codecSeen ? `audio codec "${codecSeen}" cannot be streamed (only AAC)` : 'no audio track');
 }
+function notStreamable(msg) { return audioError('not-streamable', msg); }
 
 /** 7-byte ADTS header for one raw AAC frame (profile from the ASC object type; HE-AAC signalled as LC core). */
 export function adtsHeader(cfg, frameLen) {
@@ -446,7 +481,7 @@ export async function readAudioTrack(src) {
   const read = makeReader(src), mv = await findMoov(read, sourceSize(src));
   if (!mv) throw new Error('no moov box');
   if (mv.size > 256 * 1024 * 1024) throw new Error('moov box too large');
-  return parseAudioTrack(await read(mv.offset + mv.hdr, mv.size - mv.hdr));
+  return parseAudioTrack(await read(mv.offset + mv.hdr, mv.size - mv.hdr), sourceSize(src));
 }
 
 /**
@@ -457,7 +492,9 @@ export async function decodeMp4Stream(file, { sampleRate = 8000, crop = null, on
   const read = makeReader(file), tr = await readAudioTrack(file);
   // presentation time of sample s = (dts - mediaTime) / timescale + delay
   const pt = (s) => (tr.dts[s] - tr.mediaTime) / tr.timescale + tr.delay;
-  const duration = Math.max(0, tr.duration - tr.mediaTime / tr.timescale + tr.delay);
+  // a crafted mdhd can claim hours over a few samples: never decode (silence) beyond the last real sample + 1 s
+  const lastEnd = pt(tr.n - 1) + 1024 / tr.sampleRate;
+  const duration = Math.max(0, Math.min(tr.duration - tr.mediaTime / tr.timescale + tr.delay, lastEnd + 1));
   const a = crop ? Math.max(0, crop[0]) : 0, b = crop ? Math.min(duration, crop[1]) : duration;
   if (!(b > a)) throw audioError('bad-range', 'The chosen range is outside the recording.');
   let s0 = 0; while (s0 < tr.n - 1 && pt(s0 + 1) <= a) s0++;
@@ -473,7 +510,11 @@ export async function decodeMp4Stream(file, { sampleRate = 8000, crop = null, on
 
 /** Collects mono native-rate blocks placed by presentation time, keeps [a, b), resamples to fsOut on the fly. */
 export function makeSink(a, b, fsOut) {
-  let rs = null, out = null, next = 0, endIdx = 0, fs = 0;
+  let rs = null, out = null, next = 0, endIdx = 0, fs = 0, zeros = null;
+  const silence = (g) => {                                         // <= 1M native samples per allocation
+    zeros ||= new Float32Array(1 << 20);
+    for (let k = 0; k < g; k += zeros.length) out.push(rs.push(zeros.subarray(0, Math.min(zeros.length, g - k))));
+  };
   return {
     /** x: mono samples at rate r whose first sample is at presentation time t (s). */
     put(x, t, r) {
@@ -482,7 +523,7 @@ export function makeSink(a, b, fsOut) {
       const idx = Math.round(t * r);
       if (idx > next) {                                            // gap: fill with silence
         const g = Math.min(idx, endIdx) - next;
-        if (g > 0) { out.push(rs.push(new Float32Array(g))); next += g; }
+        if (g > 0) { silence(g); next += g; }
       }
       const k = Math.max(0, next - idx);                           // overlap / before the crop: skip
       const m = Math.min(x.length, k + Math.max(0, endIdx - next));
@@ -490,7 +531,7 @@ export function makeSink(a, b, fsOut) {
     },
     finish() {
       if (!rs) return new Float32Array(0);
-      if (next < endIdx) { out.push(rs.push(new Float32Array(endIdx - next))); next = endIdx; }   // trailing silence
+      if (next < endIdx) { silence(endIdx - next); next = endIdx; }   // trailing silence
       out.push(rs.flush());
       return out.result();
     },
@@ -518,13 +559,22 @@ async function decodeWebCodecs(read, tr, s0, s1, pt, sink, onProgress) {
     error: (e) => { err ||= e; },
   });
   dec.configure(wcConfig(tr));
+  // Backpressure: wait for the queue to drain below MAXQ ('dequeue' event; a short poll where it is not supported).
+  // flush() only once at the end: a flush resets the decoder state (MDCT overlap) and costs a round trip.
+  const MAXQ = 64;
+  const drained = () => new Promise((res) => {
+    const t = setTimeout(done, 20);
+    function done() { clearTimeout(t); dec.removeEventListener?.('dequeue', done); res(); }
+    dec.addEventListener?.('dequeue', done);
+  });
   let k = 0;
   try {
     for await (const [s, bytes] of readSamples(read, tr, s0, s1)) {
       if (err) throw err;
       const dur = s + 1 < tr.n ? (tr.dts[s + 1] - tr.dts[s]) / tr.timescale : 1024 / tr.sampleRate;
       dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round(pt(s) * 1e6), duration: Math.round(dur * 1e6), data: bytes }));
-      if (++k % 256 === 0) { await dec.flush(); onProgress?.((s - s0) / (s1 - s0)); }   // bounded queue
+      while (dec.decodeQueueSize > MAXQ && !err) await drained();
+      if (++k % 256 === 0) onProgress?.((s - s0) / (s1 - s0));
     }
     await dec.flush();
     if (err) throw err;
@@ -616,7 +666,8 @@ function parseMeta(u8, b, res) {
     let o = keysBox.body + 8;
     for (let i = 0; i < cnt && o + 8 <= keysBox.end; i++) {
       const sz = dv.getUint32(o);
-      keys.push(utf8(u8.subarray(o + 8, o + sz)));
+      if (sz < 8) break;                                         // malformed: would never advance
+      keys.push(utf8(u8.subarray(o + 8, Math.min(o + sz, keysBox.end))));
       o += sz;
     }
   }
