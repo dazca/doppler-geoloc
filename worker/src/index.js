@@ -19,7 +19,7 @@
 //   * CORS allow-list from env ALLOWED_ORIGINS (default: production Pages domain + localhost), never "*" by default.
 //   * NOTE: the Cache API is a no-op on *.workers.dev. Production must use a custom domain (deploy/README.md).
 
-import { parseRoute, allowOrigin, checkLimit, TokenBuckets } from './lib.js';
+import { parseRoute, allowOrigin, checkLimit, TokenBuckets, clientKey } from './lib.js';
 
 const buckets = new TokenBuckets(); // per isolate (fallback limiter)
 const LIVE_UA = 'doppler-geoloc-worker/1.0 (live mode; contact: see deploy/README.md)';
@@ -89,7 +89,7 @@ export async function handle(req, env = {}, ctx = undefined, limiter = buckets) 
   if (!r) return err(req, env, 404, 'not found');
   if (r.error) return err(req, env, r.status, r.error);
 
-  const ip = req.headers.get('CF-Connecting-IP') || 'local';
+  const ip = clientKey(req.headers.get('CF-Connecting-IP') || 'local');
   const lim = await checkLimit(env, limiter, r.route, ip);
   if (!lim.ok) return err(req, env, 429, 'rate limited, slow down', { 'Retry-After': String(lim.retryAfterS) });
 

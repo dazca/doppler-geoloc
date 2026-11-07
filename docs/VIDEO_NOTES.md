@@ -2,7 +2,7 @@
 
 ## Sources
 - Video: https://www.youtube.com/watch?v=UytYrhYLOKI  "I discovered a sound that leaks your exact location (and it's everywhere)", channel colsto, ~29 min, uploaded about 2026-11-02 (channel/date per Digg https://digg.com/ai/7wr4rmyp and the cbonitz README).
-- Full auto-transcript was downloaded with youtube-transcript-api; it is at C:\Users\hamdd\AppData\Local\Temp\yt_tr\tr.txt (not in the repo).
+- Full auto-transcript was downloaded with youtube-transcript-api; it is at a local temp file (not in the repo).
 - Independent check: https://github.com/cbonitz/doppler-experiments (synthetic data only; good derivations in docs/ and scripts/).
 - TechRadar coverage (only the headline could be fetched): https://www.techradar.com/computing/cyber-security/youtuber-discovers-aircraft-noise-trick-that-can-geolocate-your-videos-to-within-100m-doppler-effect-pinpoints-locations-from-just-60-seconds-of-audio
 - Reimplementations: https://github.com/amintt2/flyover-locator , https://github.com/mojomast/hermes-aircraft-doppler-geolocation , https://github.com/1337isnot1337/DOPPLERGEIST

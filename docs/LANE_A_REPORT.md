@@ -39,7 +39,7 @@ Scenarios:
 ============================= test session starts =============================
 platform win32 -- Python 3.12.9, pytest-8.4.2, pluggy-1.5.0 -- C:\ProgramData\miniconda3\python.exe
 cachedir: .pytest_cache
-rootdir: C:\Users\hamdd\Workspace\Experiments\doppler_geoloc\ref
+rootdir: <repo>\ref
 plugins: anyio-4.11.0, cov-7.0.0
 collecting ... collected 23 items
 tests/test_data_adsb.py::test_category_codes PASSED

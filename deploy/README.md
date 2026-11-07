@@ -46,7 +46,7 @@ Run it once a day after adsb.lol has published the previous day (D+1 ~00:20-03:3
 
 **Option A - Windows Task Scheduler on this PC** (needs the PC on and wrangler logged in for this user):
 ```bat
-schtasks /Create /TN "doppler-adsb-daily" /SC DAILY /ST 08:30 /TR "cmd /c cd /d C:\Users\hamdd\Workspace\Experiments\doppler_geoloc && python ref\data\daily_job.py >> .cache\daily_job.log 2>&1"
+schtasks /Create /TN "doppler-adsb-daily" /SC DAILY /ST 08:30 /TR "cmd /c cd /d C:\path\to\doppler_geoloc && python ref\data\daily_job.py >> .cache\daily_job.log 2>&1"
 ```
 (08:30 local = 06:30-07:30 UTC. If the PC was off, the next run catches up the last 30 days. Remove with
 `schtasks /Delete /TN doppler-adsb-daily /F`.)

@@ -126,3 +126,12 @@ test('coverage manifest: own route, read from R2 meta/coverage.json, short cache
   assert.equal(res.headers.get('Cache-Control'), 'public, max-age=60');
   assert.deepEqual(await res.json(), JSON.parse(body));
 });
+
+test('IPv6 clients share one rate-limit key per /64', async () => {
+  const { clientKey } = await import('../src/lib.js');
+  assert.equal(clientKey('203.0.113.7'), '203.0.113.7');
+  assert.equal(clientKey('2001:db8:1:2:aaaa::1'), '2001:db8:1:2::/64');
+  assert.equal(clientKey('2001:db8:1:2:ffff:1:2:3'), '2001:db8:1:2::/64');
+  assert.equal(clientKey('2001:db8::1'), '2001:db8:0:0::/64');
+  assert.equal(clientKey('2001:0db8:0001:0002::9'), '2001:db8:1:2::/64');
+});

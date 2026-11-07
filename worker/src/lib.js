@@ -137,3 +137,12 @@ export async function checkLimit(env, buckets, route, ip) {
   }
   return local;
 }
+
+/** Rate-limit key: IPv4 as is, IPv6 reduced to its /64 (one subscriber usually owns a whole /64). */
+export function clientKey(ip) {
+  if (!ip.includes(':')) return ip;
+  let [head, tail = ''] = ip.toLowerCase().split('::');
+  const h = head ? head.split(':') : [], t = tail ? tail.split(':') : [];
+  const full = ip.includes('::') ? [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t] : h;
+  return full.slice(0, 4).map((x) => x.replace(/^0+(?=.)/, '')).join(':') + '::/64';
+}
