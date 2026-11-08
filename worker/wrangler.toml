@@ -18,7 +18,7 @@ MAX_RANGE_BYTES = "8388608"
 # Human-only access (Turnstile -> POST /session -> X-Doppler-Session, see worker/README.md "Human sessions").
 #   off: header ignored; grace: checked when sent, missing allowed; enforce: required on every data route.
 # Secrets (never in this file): SESSION_KEY (HMAC key, any long random string), TURNSTILE_SECRET (widget secret).
-SESSION_MODE = "off"
+SESSION_MODE = "grace"
 
 # Per-IP rate limits (Workers Rate Limiting binding; period must be 10 or 60 s). Keep in sync with LIMITS in
 # src/lib.js, which is also the in-isolate fallback when a binding is missing. namespace_id: any unique integer per account.
