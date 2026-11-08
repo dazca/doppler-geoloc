@@ -389,31 +389,15 @@ def test_incomplete_release_is_retried_even_when_old(tmp_path, monkeypatch):
     assert dj.build_day(dt.date(2023, 2, 20), a, lambda *x: None) is None
 
 
-# ----------------------------------------------------------------- D6: Worker probes
-def _fake_get(table):
-    def get(url, timeout=None):
-        r = requests.Response()
-        v = table(url)
-        r.status_code = v if isinstance(v, int) else 200
-        r._content = json.dumps(v).encode() if not isinstance(v, int) else b""
-        return r
-    return get
-
-
-def test_worker_has_raises_on_429_and_5xx(monkeypatch):
-    monkeypatch.setattr(dj.time, "sleep", lambda s: None)
-    for code in (429, 500, 503):
-        monkeypatch.setattr(dj.requests, "get", _fake_get(lambda u: code))
-        with pytest.raises(dj.WorkerUnavailable):
-            dj.worker_has("https://w", "x/day.json")
-    monkeypatch.setattr(dj.requests, "get", _fake_get(lambda u: 404))
-    assert dj.worker_has("https://w", "x/day.json") is False
-
-
+# ----------------------------------------------------------------- D6: "day done" probes (read from R2)
 def test_day_done_partial_recent_is_rebuilt(monkeypatch):
     today = dt.date(2026, 11, 7)
-    monkeypatch.setattr(dj.requests, "get", _fake_get(lambda u: {"status": "partial"} if "prod" in u else {}))
     monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
+    docs = {}
+    for d in (dt.date(2026, 11, 5), dt.date(2026, 10, 1)):
+        docs[f"{fa.tag_for(d, 'prod')}/day.json"] = {"status": "partial"}
+        docs[f"{fa.tag_for(d, 'mlatonly')}/day.json"] = {}
+    _FakeR2(docs).install(monkeypatch)
     assert dj.day_done("https://w", dt.date(2026, 11, 5), today) is False
     assert dj.day_done("https://w", dt.date(2026, 10, 1), today) == "partial"
 
@@ -466,7 +450,7 @@ def test_rebuild_manifest_keeps_old_days_and_probes_few(monkeypatch):
     assert "2026-10-20" in days and "2026-10-21" not in days
     assert {"2026-11-01", "2026-11-06"} <= days                    # new days added
     # probed: Aug (not in manifest, 31 d) + the last 35 days; not the 25 older September/October manifest days
-    assert len(probed) == 31 + 36 + 1  # + the R2 confirmation of the one removal
+    assert len(probed) == 31 + 36  # day_listed reads R2, so a removal needs no second confirmation probe
     assert r2.puts == 1
 
 
@@ -639,7 +623,6 @@ def test_rebuild_manifest_removal_needs_r2_confirmation(monkeypatch):
     for feed in ("prod", "mlatonly"):
         docs[f"{fa.tag_for(day, feed)}/day.json"] = {"status": "ok"}
     r2 = _FakeR2(docs).install(monkeypatch)
-    monkeypatch.setattr(dj, "worker_json", lambda w, k, tries=3: None)  # stale cached 404 from the Worker
     monkeypatch.setattr(dj.time, "sleep", lambda s: None)
     doc = dj.rebuild_manifest("https://w", "b", day, day, lambda *a: None)
     assert doc["days"] == [str(day)] and r2.puts == 0

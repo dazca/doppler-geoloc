@@ -38,7 +38,7 @@ export function parseRoute(url, maxRangeBytes = 8388608) {
   }
   // data availability manifest (ref/data/daily_job.py): rewritten after every uploaded day, so it is cached briefly only
   if (p === '/adsb/index/meta/coverage.json') {
-    return { route: 'index', r2key: 'meta/coverage.json', ttl: 60, key: `${CACHE_ORIGIN}/adsb/index/meta/coverage.json` };
+    return { route: 'index', open: true, r2key: 'meta/coverage.json', ttl: 60, key: `${CACHE_ORIGIN}/adsb/index/meta/coverage.json` };
   }
   let m = /^\/adsb\/index\/([^/]+)\/([^/]+)$/.exec(p);
   if (m) {
@@ -98,6 +98,7 @@ export const LIMITS = {
   range: { limit: 600, period: 60, binding: 'RL_RANGE' },
   point: { limit: 30, period: 60, binding: 'RL_LIVE' },
   trace: { limit: 60, period: 60, binding: 'RL_TRACE' },
+  session: { limit: 10, period: 60, binding: 'RL_SESSION' }, // POST /session (one Turnstile siteverify each)
 };
 
 /**
@@ -155,4 +156,62 @@ export function clientKey(ip) {
   const h = head ? head.split(':') : [], t = tail ? tail.split(':') : [];
   const full = ip.includes('::') ? [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t] : h;
   return full.slice(0, 4).map((x) => x.replace(/^0+(?=.)/, '')).join(':') + '::/64';
+}
+
+// ---------------------------------------------------------------- human sessions (Turnstile -> signed token)
+// POST /session verifies a Turnstile token once and returns `v1.<payload>.<sig>`: payload = base64url JSON
+// {id: random, ip: clientKey, exp: unix s}, sig = HMAC-SHA256(SESSION_KEY, "v1." + payload). Data routes then require
+// it in X-Doppler-Session (SESSION_MODE=enforce). Stateless: nothing is stored; a token is only valid from the same
+// IPv4 / IPv6 /64 until it expires.
+export const SESSION_HEADER = 'X-Doppler-Session';
+export const SESSION_TTL_S = 7200;
+const enc = new TextEncoder();
+const b64u = (u8) => btoa(String.fromCharCode(...u8)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const unb64u = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
+const hmacKey = (secret, use) => crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, [use]);
+
+/** off: X-Doppler-Session is ignored; grace: checked when present (401 if invalid), missing allowed; enforce: required. */
+export function sessionMode(env) {
+  const m = String(env?.SESSION_MODE || 'off').trim().toLowerCase();
+  return m === 'enforce' || m === 'grace' ? m : 'off';
+}
+
+export async function signSession(secret, { ip, now = Date.now(), ttlS = SESSION_TTL_S, id = b64u(crypto.getRandomValues(new Uint8Array(12))) }) {
+  const exp = Math.floor(now / 1000) + ttlS;
+  const body = 'v1.' + b64u(enc.encode(JSON.stringify({ id, ip, exp })));
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', await hmacKey(secret, 'sign'), enc.encode(body)));
+  return { token: `${body}.${b64u(sig)}`, id, exp };
+}
+
+/** {ok:true, id, exp} or {ok:false, why: 'malformed'|'signature'|'expired'|'ip'}. Signature checked before anything else. */
+export async function verifySession(secret, token, { ip, now = Date.now() }) {
+  const m = /^(v1\.([A-Za-z0-9_-]{1,400}))\.([A-Za-z0-9_-]{43})$/.exec(token || '');
+  if (!m) return { ok: false, why: 'malformed' };
+  let p;
+  try {
+    // crypto.subtle.verify compares in constant time
+    if (!await crypto.subtle.verify('HMAC', await hmacKey(secret, 'verify'), unb64u(m[3]), enc.encode(m[1]))) return { ok: false, why: 'signature' };
+    p = JSON.parse(new TextDecoder().decode(unb64u(m[2])));
+  } catch { return { ok: false, why: 'malformed' }; }
+  if (!(p && typeof p.id === 'string' && Number.isFinite(p.exp))) return { ok: false, why: 'malformed' };
+  if (p.exp * 1000 <= now) return { ok: false, why: 'expired' };
+  if (p.ip !== ip) return { ok: false, why: 'ip' };
+  return { ok: true, id: p.id, exp: p.exp };
+}
+
+/**
+ * Cloudflare Turnstile siteverify. The token must have been issued for the page that is asking (hostname = Origin's
+ * host) and for action "session". Returns {ok, why}. Throws on network failure (caller answers 502).
+ */
+export async function verifyTurnstile(secret, token, { ip, origin, f = fetch }) {
+  const body = new URLSearchParams({ secret, response: token });
+  if (ip && ip !== 'local') body.set('remoteip', ip);
+  const r = await f('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', body });
+  const d = await r.json().catch(() => ({}));
+  if (!d.success) return { ok: false, why: (d['error-codes'] || ['failed']).join(',') };
+  let host = '';
+  try { host = new URL(origin).hostname; } catch { /* no origin */ }
+  if (d.hostname !== host) return { ok: false, why: 'hostname' };
+  if (d.action && d.action !== 'session') return { ok: false, why: 'action' };
+  return { ok: true };
 }

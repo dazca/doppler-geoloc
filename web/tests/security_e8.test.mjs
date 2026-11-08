@@ -19,6 +19,8 @@ test('L2: map tooltip does not pass flight data as an HTML string; CSP pins Leaf
   assert.ok(!/bindTooltip\(`/.test(src), 'tooltip must not be an HTML template string');
   assert.ok(/tip\.textContent\s*=/.test(src));
   const hdr = readFileSync(new URL('../_headers', import.meta.url), 'utf8');
-  assert.match(hdr, /script-src 'self' blob: https:\/\/unpkg\.com\/leaflet@1\.9\.4\/dist\/leaflet\.js;/);
+  // Leaflet pinned to its exact file; Turnstile (human check, web/ui/data-session.js) only from its own origin
+  assert.match(hdr, /script-src 'self' blob: https:\/\/unpkg\.com\/leaflet@1\.9\.4\/dist\/leaflet\.js https:\/\/challenges\.cloudflare\.com;/);
+  assert.match(hdr, /frame-src https:\/\/challenges\.cloudflare\.com;/);
   assert.match(hdr, /style-src 'self' https:\/\/unpkg\.com\/leaflet@1\.9\.4\/dist\/leaflet\.css;/);
 });

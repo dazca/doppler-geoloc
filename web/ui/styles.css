@@ -506,3 +506,7 @@ progress::-moz-progress-bar { background: var(--primary); }
   .spinner, .hint.is-busy::before { animation: none; }
   .live-dot.is-on { animation: none; }
 }
+
+/* Turnstile human check (web/ui/data-session.js): invisible unless Cloudflare asks for a click */
+.turnstile-box { position: fixed; right: 12px; bottom: 12px; z-index: 1000; }
+.turnstile-box:empty { display: none; }

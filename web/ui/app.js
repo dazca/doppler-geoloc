@@ -19,6 +19,7 @@ import { detectCuts } from './segment.js';
 import { detectPasses } from './autodetect.js';
 import { PLACES, findPlace, nearestPlace } from './places.js';
 import { t, lang, setLang, applyI18n, onLangChange, fmtDateTime, fmtDate } from './i18n.js';
+import { installDataSession } from './data-session.js';
 
 const $ = (id) => document.getElementById(id);
 const h = (tag, attrs = {}, ...kids) => {
@@ -40,6 +41,15 @@ const CLASSES = ['prop', 'heli', 'jet', 'unknown'];
 const DEMO = { audio: new URL('demo/scenario1/audio.m4a', location.href), marks: new URL('demo/scenario1/events_measured.json', location.href),
   tStart: 1717243200, tz: 'America/New_York', center: [40.812, -72.87], radius: 12000 };
 const CFG = globalThis.OVERHEAD_CONFIG || {};
+// Human check for the data server (Turnstile, only if config.js has turnstileSiteKey): wraps the global fetch so every
+// data request to the Worker carries X-Doppler-Session. Invisible for real users; a failure shows a retry banner.
+const DATA_SESSION = installDataSession(CFG, { onState: (st) => {
+  if (st !== 'failed') { if (R.sessionBanner) { R.sessionBanner = false; banner(null); } return; }
+  R.sessionBanner = banner([h('strong', {}, t('session.failed')), ' ', t('session.failed.sub'), ' ',
+    h('button', { type: 'button', class: 'btn btn--primary btn--sm', id: 'btn-session-retry', onclick: () => {
+      banner(null); R.sessionBanner = false; DATA_SESSION.retry().catch(() => {});
+    } }, t('session.retry'))]);
+} });
 const QS = new URLSearchParams(location.search);
 const DATA_TZ = 'Europe/Madrid';
 const MAX_R = CFG.maxRadius_m || 30000;

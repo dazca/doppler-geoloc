@@ -67,7 +67,8 @@ repository holding this project and add the secrets `CLOUDFLARE_API_TOKEN` (R2 e
      * Deployed value: `https://doppler.azemar.eu` plus the localhost dev origins. It is never `*`.
      * You may drop the localhost entries in production.
      * An origin that is not listed gets no `Access-Control-Allow-Origin` header.
-   * Rate limits are four `[[ratelimits]]` bindings, applied per client IP (`CF-Connecting-IP`):
+   * Rate limits are five `[[ratelimits]]` bindings, applied per client IP (`CF-Connecting-IP`) and, with
+     human sessions on, also per session (worker/README.md "Human sessions"):
 
      | Route | Budget |
      |---|---|
@@ -75,12 +76,26 @@ repository holding this project and add the secrets `CLOUDFLARE_API_TOKEN` (R2 e
      | range | 600/min |
      | live point | 30/min |
      | traces | 60/min |
+     | POST /session | 10/min |
 
      * These are mirrored in `LIMITS` in `worker/src/lib.js`, which also runs an in-isolate token bucket on every
        request.
      * Over budget, the Worker returns `429` with `Retry-After`. `web/engine/adsb.js` honours it.
-     * `namespace_id`s are 91301-91304 (unique on this account). A WAF rate-limiting rule on the custom domain is an optional
-       extra layer.
+     * `namespace_id`s are 91301-91305 (unique on this account).
+   * Edge rate limit (WAF, owner's dashboard; the API tokens here have no WAF scope). The in-Worker limits above run
+     after the request is already a billed Worker invocation, so this rule drops floods before the Worker:
+     Dashboard → azemar.eu → Security → WAF → Rate limiting rules → Create rule:
+     * Name `doppler-data per-IP cap`. Expression (Edit expression; Free plan allows path fields only, so it applies
+       to these paths on every azemar.eu host, which no other azemar.eu site uses):
+       `(starts_with(http.request.uri.path, "/adsb/") or starts_with(http.request.uri.path, "/v2/point/") or starts_with(http.request.uri.path, "/data/traces/") or http.request.uri.path in {"/session" "/health"})`
+     * Characteristics: IP. Rate: **300 requests / 10 s**. Action: Block, duration 10 s.
+     * Sizing: a generic-path search is ~100 range GETs at concurrency 8, each with a CORS preflight (the WAF counts
+       OPTIONS too), so ~200 per 10 s on a fast link; tile searches are 10-60; live polling is a few per 10 s.
+     * Limit of this layer: a single IP that stays just under the cap still gets ~15 req/s (300 per 20 s), i.e. the
+       Workers Free 100k/day account quota in ~2 h. Only Workers Paid ($5/month, with a billing notification) or a
+       separate Cloudflare account for this public Worker removes that shared-quota risk.
+     * Bot Fight Mode: not recommended. On Free it is zone-wide with no skip rules, so it would also hit the other
+       azemar.eu sites and the unauthenticated coverage read in `.github/workflows/backfill.yml`.
 2. Deploy and check:
 ```bash
 cd worker

@@ -36,6 +36,38 @@ For production this would be a daily GitHub Action / cron box (see docs/DATA.md 
 - **Custom domain:** the Cache API is a no-op on `*.workers.dev`, so production needs one (deploy/README.md §2).
 - **Tests (offline):** `node --test worker/test/worker.test.mjs`.
 
+- **Upstream retry (`/adsb/range`):** GitHub's release CDN intermittently answers 5xx/504 or resets. The Worker tries
+  3 times (waits 200 ms, 600 ms) and only then returns `502` with `Retry-After: 5`. 404/416 are final.
+
+## Human sessions (Turnstile)
+Goal: only people using the app (not scripts) get data. Code is deployed but **inert** until the steps below are done.
+- `POST /session {"token": <Turnstile token>}` (allowed `Origin` only, 10/min per IP) → siteverify (`secret`, token,
+  `remoteip`; `hostname` must equal the Origin's host and `action` must be `session`) → `{session, exp}`.
+- Session token: `v1.<base64url {id, ip, exp}>.<HMAC-SHA256(SESSION_KEY)>`, valid 2 h, only from the same IPv4 or
+  IPv6 /64. Stateless: nothing stored.
+- `SESSION_MODE` (wrangler.toml var): `off` (header ignored) / `grace` (checked when sent, missing allowed) /
+  `enforce` (every data route needs `X-Doppler-Session`, else `401 {"code":"session"}`). The check runs BEFORE the
+  cache, so cached data is never served without a session. `enforce` without `SESSION_KEY` fails closed (503).
+- Open in every mode: `/health`, `/adsb/index/meta/coverage.json` (public list of days; the app reads it on load and
+  `.github/workflows/backfill.yml` reads it without credentials).
+- Per-session budgets (same numbers as per IP, key `s:<id>`) apply on top of the per-IP ones.
+- The browser side is `web/ui/data-session.js` (one invisible/managed Turnstile run per page session, renews before
+  expiry and once on a 401). The data pipeline never uses the Worker for "day done" checks: it reads R2 directly.
+- Trade-off: the custom header makes browsers send a CORS preflight; it is cached per URL (Chrome up to 2 h), so a
+  first search costs up to ~2x Worker requests.
+
+Turning it on (owner; needs the Cloudflare dashboard, the wrangler OAuth token has no Turnstile scope):
+1. Dashboard → Turnstile → Add widget: name `doppler`, hostnames `doppler.azemar.eu` and `localhost`,
+   widget mode **Managed**, pre-clearance off. Copy the site key and the secret key.
+2. Store the secret without echoing it: `cd worker && npx wrangler secret put TURNSTILE_SECRET` (paste at the
+   prompt). `SESSION_KEY` is already set (2026-11-08); rotate with `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))" | npx wrangler secret put SESSION_KEY`
+   (rotation logs everyone out once; the app renews automatically).
+3. Build and deploy the app with the site key (it starts sending sessions; the Worker still ignores them):
+   `node deploy/build.mjs https://doppler-data.azemar.eu <SITE_KEY>` then the Pages deploy (deploy/README.md §4).
+4. Set `SESSION_MODE = "grace"`, `npx wrangler deploy`, use the app once (search + live); then `"enforce"` and deploy.
+5. Check: `curl -s -o /dev/null -w "%{http_code}" https://doppler-data.azemar.eu/adsb/tile/2026-11-06/263364.json` → 401.
+   Roll back at any time with `SESSION_MODE = "off"` + deploy.
+
 ## Local test plan
 1. `cd worker && npx wrangler dev` (R2 is simulated locally; put a shard with
    `npx wrangler r2 object put doppler-adsb-index/<tag>/<cell>.json --file ... --local`).

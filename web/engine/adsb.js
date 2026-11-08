@@ -55,6 +55,8 @@ export async function fetchRetry(f, url, { retries = 3, baseMs = 300, sleep = (m
       last = new Error(`HTTP ${r.status}`);
       const ra = Number(r.headers?.get?.('Retry-After'));
       if (r.status === 429 && ra > 0) wait = Math.min(30, ra) * 1000; // Worker rate limit: honour Retry-After
+      // 502/503/504 (Worker already retried upstream): honour a short Retry-After, capped so one bad trace cannot stall a slot
+      else if (ra > 0) wait = Math.max(wait, Math.min(3, ra) * 1000);
     } catch (e) { if (e?.name === 'AbortError') throw e; last = e; }
     if (i < retries) await sleep(wait);
   }
@@ -156,6 +158,8 @@ export async function fetchDayStatus({ worker, t0, t1, feeds = ['prod', 'mlatonl
   return out;
 }
 
+const RANGE_BREAKER = 8; // consecutive failed trace downloads before retries are dropped (GitHub release CDN outage)
+
 export async function fetchTracks({ worker, bbox, t0, t1, feeds = ['prod', 'mlatonly'], maxAltFt = 20000,
   types = null, skipJets = false, fetch: f = globalThis.fetch.bind(globalThis), concurrency = 8, onProgress = () => {},
   retry = {} }) {
@@ -195,17 +199,21 @@ export async function fetchTracks({ worker, bbox, t0, t1, feeds = ['prod', 'mlat
   geoidN = nN ? geoidN / nN : 0; // N varies < ~3 m over a 150 km bbox; one value is enough
   const uniq = [...new Map(jobs.map((j) => [`${j.repo || ''}/${j.release}/${j.part}/${j.start}`, j])).values()];
   const traces = [];
-  let done = 0;
+  let done = 0, streak = 0;
   const total = uniq.length;
   async function worker1() {
     while (uniq.length) {
       const j = uniq.pop();
       try {
-        const r = await fetchRetry(f, `${worker}/adsb/range?tag=${j.release}&part=${j.part}&start=${j.start}&end=${j.start + j.size - 1}${j.repo ? `&repo=${j.repo}` : ''}`, retry);
+        // The Worker retries GitHub 3x itself; 3 client attempts more, then the trace is counted in `failed` and skipped.
+        // Circuit breaker: after RANGE_BREAKER consecutive failures (upstream archive down) one attempt per trace only.
+        const opt = streak >= RANGE_BREAKER ? { ...retry, retries: 0 } : { retries: 2, ...retry };
+        const r = await fetchRetry(f, `${worker}/adsb/range?tag=${j.release}&part=${j.part}&start=${j.start}&end=${j.start + j.size - 1}${j.repo ? `&repo=${j.repo}` : ''}`, opt);
         if (!r.ok) throw new Error(`range ${j.icao}: HTTP ${r.status}`);
         traces.push({ feed: j.tag.includes('mlatonly') ? 'mlatonly' : 'prod',
           d: JSON.parse(await gunzip(new Uint8Array(await r.arrayBuffer()))) });
-      } catch (e) { if (e?.name === 'AbortError') throw e; failed.push(`${j.icao}: ${e.message || e}`); }
+        streak = 0;
+      } catch (e) { if (e?.name === 'AbortError') throw e; streak++; failed.push(`${j.icao}: ${e.message || e}`); }
       try { onProgress(++done, total); } catch { /* a broken progress callback must not fail the download */ }
     }
   }

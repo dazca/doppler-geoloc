@@ -1,10 +1,10 @@
 """Daily data job for the deployed backend (Catalonia + Andorra): build + upload every missing recent UTC day.
 
 Idempotent and catch-up by design: for each day in the last --days UTC days (default 30, ending yesterday), newest
-first, it asks the live Worker whether <prod tag>/day.json AND <mlatonly tag>/day.json exist. Days that have both are
+first, it reads R2 to see whether <prod tag>/day.json AND <mlatonly tag>/day.json exist. Days that have both are
 skipped (except a prod day.json with status "partial" younger than 7 days, unless the cause is upstream corruption:
 rebuilt in case adsb.lol re-published it).
-If the Worker cannot answer (429/5xx/network) the day is skipped this run, never rebuilt blindly. Any other day is
+If R2 cannot answer (429/5xx/network) the day is skipped this run, never rebuilt blindly. Any other day is
 built and uploaded:
   1. stream the adsb.lol prod and mlatonly tars ONCE each (~3-5 GB in total; nothing is written to disk but the index),
      keeping only the region's tracks (non-jets whole; jets only as low baro+geom points for the baro calibration),
@@ -129,50 +129,24 @@ def split_by_cell(found):
     return per
 
 
-# ----------------------------------------------------------------- Worker probes
+# ----------------------------------------------------------------- "day done" probes (R2)
 class WorkerUnavailable(RuntimeError):
     """The Worker could not say whether a key exists (429 / 5xx / network): never treated as 'missing'."""
 
 
-def worker_json(worker, key, tries=4):
-    """Parsed JSON the Worker serves at /adsb/index/<key>, None on 404; raises WorkerUnavailable otherwise."""
-    for attempt in range(tries):
-        try:
-            r = requests.get(f"{worker}/adsb/index/{key}", timeout=30)
-            if r.status_code == 404:
-                return None
-            if r.status_code == 200:
-                try:
-                    return r.json()
-                except ValueError:
-                    return {}
-            wait = float(r.headers.get("Retry-After") or 5) if r.status_code == 429 else 3 * 2 ** attempt
-            why = f"HTTP {r.status_code}"
-        except requests.RequestException as e:
-            wait, why = 3 * 2 ** attempt, type(e).__name__
-        if attempt + 1 < tries:
-            time.sleep(min(wait, 60) * (0.5 + random.random()))
-    raise WorkerUnavailable(f"cannot tell whether {key} exists ({why})")
-
-
-def worker_has(worker, key, tries=3):
-    return worker_json(worker, key, tries) is not None
-
-
 def day_json(worker, bucket, day, feed, tries=3, r2=None):
-    """<tag>/day.json of the day/feed: parsed dict, or None if absent.  Read straight from R2 when an API token is
-    set (r2=None) or r2=True, else via the Worker (cached up to 5 min for a 404, a day for a hit, so it can be stale).
+    """<tag>/day.json of the day/feed: parsed dict, or None if absent.  Always read straight from R2 (REST API with
+    CLOUDFLARE_API_TOKEN, else wrangler): the public Worker can require a browser session (SESSION_MODE=enforce), and
+    its cache can be stale. `worker`, `tries` and `r2` are kept for call compatibility.
     Raises WorkerUnavailable if the answer is unknown (AuthError passes through)."""
     key = f"{fa.tag_for(day, feed)}/day.json"
-    if _use_api() if r2 is None else r2:
-        try:
-            doc = r2_get_json(bucket, key)
-        except AuthError:
-            raise
-        except Exception as e:
-            raise WorkerUnavailable(f"cannot read {key} from R2 ({type(e).__name__}: {e})") from e
-        return doc if doc is None or isinstance(doc, dict) else {}
-    return worker_json(worker, key, tries)
+    try:
+        doc = r2_get_json(bucket, key)
+    except AuthError:
+        raise
+    except Exception as e:
+        raise WorkerUnavailable(f"cannot read {key} from R2 ({type(e).__name__}: {e})") from e
+    return doc if doc is None or isinstance(doc, dict) else {}
 
 
 def day_done(worker, day, today=None, tries=3, bucket=BUCKET):
@@ -363,7 +337,7 @@ def manifest_add(bucket, day, log):
 def rebuild_manifest(worker, bucket, since, until, log, par=4, recheck_days=RECHECK_DAYS):
     """Merge the served days into the manifest without ever losing knowledge:
     probe only days in [since, until] NOT in the current manifest, plus the last `recheck_days` days (few hundred
-    requests at most, the Worker's index rate limit is 240/min); a day the Worker definitely does not serve (404) is
+    R2 reads at most); a day whose day.json is definitely absent from R2 is
     removed, a day whose probe fails keeps its previous state, and days older than `since` are kept as they are."""
     t = time.time()
     cur = r2_get_json(bucket, MANIFEST_KEY) or {}
@@ -374,10 +348,7 @@ def rebuild_manifest(worker, bucket, since, until, log, par=4, recheck_days=RECH
 
     def check(d):
         try:
-            ok = day_listed(worker, d, 8, bucket)
-            if ok is False and str(d) in known and not _use_api():
-                ok = day_listed(worker, d, 8, bucket, True)  # a removal must be confirmed by R2, not a cached 404
-            return ok
+            return day_listed(worker, d, 8, bucket)  # read from R2, so a removal is never a stale cached 404
         except AuthError:
             raise
         except Exception as e:
@@ -512,7 +483,7 @@ def main(argv=None):
     ap.add_argument("--max-time", type=float, default=0, metavar="MINUTES",
                     help="do not start a day that would not finish within MINUTES of the job start (0 = no limit); "
                          "the days left are printed as REMAINING")
-    ap.add_argument("--worker", default=WORKER, help="Worker origin used for the 'already done' check")
+    ap.add_argument("--worker", default=WORKER, help="unused (the 'already done' check reads R2 directly); kept for compatibility")
     ap.add_argument("--bucket", default=BUCKET)
     ap.add_argument("--cache", default=fa.DEFAULT_CACHE)
     ap.add_argument("--work", default=WORK)

@@ -161,3 +161,49 @@ test('rangeSource: repo only when it differs from the release year; bad values i
     { release: 'v2026.11.01-planes-readsb-prod-1', repo: undefined });
   assert.deepEqual(rangeSource(T, { release: 'evil&x=1', repo: 'globe_history_x' }), { release: T, repo: undefined });
 });
+
+test('fetchRetry: 502/503/504 retried with backoff; a short Retry-After is honoured, capped at 3 s', async () => {
+  const waits = [];
+  let n = 0;
+  const f = async () => (n++ < 2 ? new Response('', { status: n === 1 ? 504 : 502, headers: { 'Retry-After': n === 1 ? '60' : '1' } }) : new Response('ok'));
+  const r = await fetchRetry(f, 'u', { sleep: async (ms) => { waits.push(ms); } });
+  assert.equal(await r.text(), 'ok');
+  assert.deepEqual(waits, [3000, 1000]); // 60 s capped to 3 s; then max(600 ms backoff, 1 s)
+});
+
+test('fetchTracks: a trace whose range keeps failing (502) is counted in `failed`; the others still download', async () => {
+  const { gzipSync } = await import('node:zlib');
+  const t0 = Date.UTC(2026, 10, 7, 19) / 1000;
+  const calls = {};
+  const f = async (u) => {
+    if (u.includes('/adsb/index/') && u.includes('prod') && !u.includes('day.json')) {
+      return json({ geoid_N: 50, traces: ['aaaaa1', 'aaaaa2', 'aaaaa3'].map((h, i) => [h, 'P208', 'aa', i * 1000, 100, t0, t0 + 600, 1000]) });
+    }
+    if (u.includes('/adsb/range')) {
+      calls[u] = (calls[u] || 0) + 1;
+      if (u.includes('start=1000&')) return new Response('', { status: 502, headers: { 'Retry-After': '5' } });
+      return new Response(gzipSync(JSON.stringify({ icao: 'aaaaa1', timestamp: t0, trace: [] })));
+    }
+    return new Response('', { status: 404 });
+  };
+  const out = await fetchTracks({ worker: 'w', bbox: [41.5, 2.0, 41.51, 2.01], t0, t1: t0 + 3600, fetch: f, retry: noSleep });
+  assert.equal(out.failed.length, 1);
+  assert.match(out.failed[0], /aaaaa2/);
+  assert.equal(calls['w/adsb/range?tag=v2026.11.07-planes-readsb-prod-0&part=aa&start=1000&end=1099'], 3, '3 attempts, then skipped');
+  assert.ok(out.warnings.some((w) => /1 index\/trace downloads failed/.test(w)));
+});
+
+test('fetchTracks: when every range fails (archive down), retries stop after 8 consecutive failures', async () => {
+  const t0 = Date.UTC(2026, 10, 7, 19) / 1000;
+  let rangeCalls = 0;
+  const f = async (u) => {
+    if (u.includes('/adsb/index/') && u.includes('prod') && !u.includes('day.json')) {
+      return json({ geoid_N: 50, traces: Array.from({ length: 40 }, (_, i) => [`a${String(i).padStart(5, '0')}`, 'P208', 'aa', i * 1000, 100, t0, t0 + 600, 1000]) });
+    }
+    if (u.includes('/adsb/range')) { rangeCalls++; return new Response('', { status: 502 }); }
+    return new Response('', { status: 404 });
+  };
+  const out = await fetchTracks({ worker: 'w', bbox: [41.5, 2.0, 41.51, 2.01], t0, t1: t0 + 3600, fetch: f, retry: noSleep, concurrency: 1 });
+  assert.equal(out.failed.length, 40);
+  assert.equal(rangeCalls, 8 * 3 + 32, '8 traces with 3 attempts, the rest with one');
+});

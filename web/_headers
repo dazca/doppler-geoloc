@@ -6,10 +6,11 @@
 #  - blob: in script-src is for the AudioWorklet module of live recording (web/live/recorder.js builds it from a Blob).
 #  - data: in img-src: favicon and the score heat map (canvas.toDataURL); blob: in media-src: playback of the user's file.
 #  - Tiles: Esri (server.arcgisonline.com) and OSM. DEM: AWS Terrain Tiles on s3.amazonaws.com.
+#  - challenges.cloudflare.com (script + frame): Turnstile human check before data requests (web/ui/data-session.js).
 #  - No 'unsafe-inline' and no 'unsafe-eval': the app sets styles through the CSSOM only.
 # Cross-origin isolation (COOP/COEP) is deliberately NOT enabled; see deploy/README.md "SharedArrayBuffer".
 /*
-  Content-Security-Policy: default-src 'self'; script-src 'self' blob: https://unpkg.com/leaflet@1.9.4/dist/leaflet.js; style-src 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: blob: https://unpkg.com https://server.arcgisonline.com https://tile.openstreetmap.org; connect-src 'self' https://s3.amazonaws.com https://elevation-tiles-prod.s3.amazonaws.com __WORKER_ORIGIN__; worker-src 'self' blob:; media-src 'self' blob:; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'; upgrade-insecure-requests
+  Content-Security-Policy: default-src 'self'; script-src 'self' blob: https://unpkg.com/leaflet@1.9.4/dist/leaflet.js https://challenges.cloudflare.com; style-src 'self' https://unpkg.com/leaflet@1.9.4/dist/leaflet.css; img-src 'self' data: blob: https://unpkg.com https://server.arcgisonline.com https://tile.openstreetmap.org; connect-src 'self' https://s3.amazonaws.com https://elevation-tiles-prod.s3.amazonaws.com __WORKER_ORIGIN__; worker-src 'self' blob:; frame-src https://challenges.cloudflare.com; media-src 'self' blob:; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'; upgrade-insecure-requests
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
   Permissions-Policy: microphone=(self), geolocation=(self), camera=(), payment=(), usb=()

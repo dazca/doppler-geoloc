@@ -1,7 +1,8 @@
 // Offline tests for the Worker (no Cloudflare runtime needed): node --test worker/test/worker.test.mjs
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseRoute, allowOrigin, TokenBuckets, checkLimit, LIMITS, DEFAULT_ALLOWED_ORIGINS } from '../src/lib.js';
+import { parseRoute, allowOrigin, TokenBuckets, checkLimit, LIMITS, DEFAULT_ALLOWED_ORIGINS, signSession, verifySession,
+  sessionMode, SESSION_TTL_S } from '../src/lib.js';
 import { handle } from '../src/index.js';
 
 const U = (s) => new URL(s, 'https://w.example');
@@ -212,4 +213,163 @@ test('range: neighbouring-year repo and -0tmp/-1 tags (review F1)', async () => 
   const res = await handle(new Request(`https://w.example/adsb/range?tag=${D31}&part=aa&start=0&end=9&repo=2026`), {}, undefined, new TokenBuckets());
   assert.equal(res.status, 200);
   assert.equal(upstream[0][0], `https://github.com/adsblol/globe_history_2026/releases/download/${D31}/${D31}.tar.aa`);
+});
+
+// ---------------------------------------------------------------- human sessions (Turnstile -> X-Doppler-Session)
+const KEY = 'test-session-key-0123456789abcdef';
+const APP = 'https://doppler.azemar.eu';
+const tileEnv = (extra = {}) => ({ SESSION_MODE: 'enforce', SESSION_KEY: KEY, TURNSTILE_SECRET: 'ts-secret', ALLOWED_ORIGINS: `${APP},http://localhost:8000`,
+  INDEX: { get: async () => ({ arrayBuffer: async () => new Uint8Array([31, 139]).buffer }) }, ...extra });
+const tileReq = (sess, ip = '9.9.9.9', path = '/adsb/tile/2026-11-06/263364.json') => new Request(`https://w.example${path}`,
+  { headers: { Origin: APP, 'CF-Connecting-IP': ip, ...(sess ? { 'X-Doppler-Session': sess } : {}) } });
+/** fetch stub: siteverify answers `verdict`, everything else as stubs() */
+function turnstileStub(verdict) {
+  const s = stubs(), calls = [];
+  const up = globalThis.fetch;
+  globalThis.fetch = async (u, init) => {
+    if (String(u).startsWith('https://challenges.cloudflare.com/')) { calls.push(Object.fromEntries(init.body)); return Response.json(verdict); }
+    return up(u, init);
+  };
+  return { ...s, calls };
+}
+const postSession = (body, { origin = APP, ip = '9.9.9.9' } = {}) => new Request('https://w.example/session',
+  { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json', Origin: origin, 'CF-Connecting-IP': ip } });
+
+test('session token: round trip, bound to the client IP key, expires, rejects tampering', async () => {
+  const now = 1_800_000_000_000;
+  const s = await signSession(KEY, { ip: '9.9.9.9', now });
+  assert.equal(s.exp, now / 1000 + SESSION_TTL_S);
+  assert.deepEqual(await verifySession(KEY, s.token, { ip: '9.9.9.9', now }), { ok: true, id: s.id, exp: s.exp });
+  assert.equal((await verifySession(KEY, s.token, { ip: '8.8.8.8', now })).why, 'ip');
+  assert.equal((await verifySession(KEY, s.token, { ip: '9.9.9.9', now: now + SESSION_TTL_S * 1000 })).why, 'expired');
+  assert.equal((await verifySession('other-key', s.token, { ip: '9.9.9.9', now })).why, 'signature');
+  // forge a payload with a later expiry / another IP but keep the signature
+  const [v, , sig] = s.token.split('.');
+  const forged = Buffer.from(JSON.stringify({ id: s.id, ip: '8.8.8.8', exp: s.exp + 1e6 })).toString('base64url');
+  assert.equal((await verifySession(KEY, `${v}.${forged}.${sig}`, { ip: '8.8.8.8', now })).why, 'signature');
+  // flip one signature character
+  const flip = s.token.slice(0, -1) + (s.token.endsWith('A') ? 'B' : 'A');
+  assert.equal((await verifySession(KEY, flip, { ip: '9.9.9.9', now })).ok, false);
+  for (const junk of ['', 'abc', 'v1..x', `v2.${s.token.slice(3)}`, s.token + 'x']) assert.equal((await verifySession(KEY, junk, { ip: '9.9.9.9', now })).ok, false, junk);
+  assert.deepEqual(['off', 'grace', 'enforce', 'off'].map((m, i) => sessionMode(i === 3 ? {} : { SESSION_MODE: m })), ['off', 'grace', 'enforce', 'off']);
+});
+
+test('POST /session: Turnstile verified (secret, token, remoteip; hostname + action checked) -> usable session', async () => {
+  const { calls } = turnstileStub({ success: true, hostname: 'doppler.azemar.eu', action: 'session' });
+  const lim = new TokenBuckets();
+  const r = await handle(postSession({ token: 'tok-1' }), tileEnv(), undefined, lim);
+  assert.equal(r.status, 200);
+  assert.equal(r.headers.get('Access-Control-Allow-Origin'), APP);
+  assert.equal(r.headers.get('Cache-Control'), 'no-store');
+  assert.deepEqual(calls, [{ secret: 'ts-secret', response: 'tok-1', remoteip: '9.9.9.9' }]);
+  const { session, exp } = await r.json();
+  assert.ok(exp > Date.now() / 1000);
+  assert.equal((await handle(tileReq(session), tileEnv(), undefined, lim)).status, 200);
+  assert.equal((await handle(tileReq(session, '7.7.7.7'), tileEnv(), undefined, lim)).status, 401, 'other IP');
+});
+
+test('POST /session: rejects failed / foreign-host / wrong-action tokens, bad origins, missing token, unconfigured', async () => {
+  const lim = new TokenBuckets();
+  turnstileStub({ success: false, 'error-codes': ['invalid-input-response'] });
+  assert.equal((await handle(postSession({ token: 't' }), tileEnv(), undefined, lim)).status, 403);
+  turnstileStub({ success: true, hostname: 'evil.example', action: 'session' });
+  assert.equal((await handle(postSession({ token: 't' }), tileEnv(), undefined, lim)).status, 403);
+  turnstileStub({ success: true, hostname: 'doppler.azemar.eu', action: 'login' });
+  assert.equal((await handle(postSession({ token: 't' }), tileEnv(), undefined, lim)).status, 403);
+  const { calls } = turnstileStub({ success: true, hostname: 'evil.example' });
+  assert.equal((await handle(postSession({ token: 't' }, { origin: 'https://evil.example' }), tileEnv(), undefined, lim)).status, 403);
+  assert.equal((await handle(postSession({}), tileEnv(), undefined, lim)).status, 400);
+  assert.equal(calls.length, 0, 'no siteverify for a foreign origin or a missing token');
+  assert.equal((await handle(postSession({ token: 't' }), tileEnv({ TURNSTILE_SECRET: '' }), undefined, lim)).status, 501);
+  assert.equal((await handle(new Request('https://w.example/session'), tileEnv(), undefined, lim)).status, 405);
+  // siteverify down -> 502 retryable
+  stubs();
+  globalThis.fetch = async () => { throw new TypeError('network'); };
+  assert.equal((await handle(postSession({ token: 't' }), tileEnv(), undefined, lim)).status, 502);
+});
+
+test('POST /session is rate-limited per IP (10/min), before any siteverify', async () => {
+  const { calls } = turnstileStub({ success: true, hostname: 'doppler.azemar.eu' });
+  const lim = new TokenBuckets();
+  for (let i = 0; i < LIMITS.session.limit; i++) assert.equal((await handle(postSession({ token: 't' }), tileEnv(), undefined, lim)).status, 200);
+  assert.equal((await handle(postSession({ token: 't' }), tileEnv(), undefined, lim)).status, 429);
+  assert.equal(calls.length, LIMITS.session.limit);
+});
+
+test('enforce: missing / tampered / expired session -> 401 code "session", even when the tile is already cached', async () => {
+  const { store } = stubs();
+  const lim = new TokenBuckets();
+  const ok = (await signSession(KEY, { ip: '9.9.9.9' })).token;
+  const warm = await handle(tileReq(ok), tileEnv(), undefined, lim);
+  assert.equal(warm.status, 200);
+  assert.equal(store.size, 1, 'tile now in the edge cache');
+  const hit = await handle(tileReq(ok), tileEnv(), undefined, lim);
+  assert.equal(hit.headers.get('X-Cache'), 'HIT');
+  const expired = (await signSession(KEY, { ip: '9.9.9.9', now: Date.now() - (SESSION_TTL_S + 1) * 1000 })).token;
+  for (const s of [null, ok.slice(0, -2) + 'xx', expired, (await signSession('k2', { ip: '9.9.9.9' })).token]) {
+    const r = await handle(tileReq(s), tileEnv(), undefined, lim);
+    assert.equal(r.status, 401, String(s));
+    assert.equal((await r.json()).code, 'session');
+    assert.equal(r.headers.get('Access-Control-Allow-Origin'), APP, '401 readable by the app');
+    assert.equal(r.headers.get('X-Cache'), null, 'never reached the cache');
+  }
+  // every gated route; the coverage manifest and /health stay open
+  for (const p of [`/adsb/index/${TAG}/day.json`, `/adsb/range?tag=${TAG}&start=0&end=9`, '/v2/point/41.52/2.10/25', '/data/traces/ef/trace_full_abcdef.json'])
+    assert.equal((await handle(tileReq(null, '9.9.9.9', p), tileEnv(), undefined, lim)).status, 401, p);
+  assert.equal((await handle(tileReq(null, '9.9.9.9', '/adsb/index/meta/coverage.json'), tileEnv(), undefined, lim)).status, 200);
+  assert.equal((await handle(tileReq(null, '9.9.9.9', '/health'), tileEnv(), undefined, lim)).status, 200);
+  // enforce without a key fails closed
+  assert.equal((await handle(tileReq(ok), tileEnv({ SESSION_KEY: '' }), undefined, lim)).status, 503);
+});
+
+test('grace allows a missing session but rejects a bad one; off ignores the header', async () => {
+  stubs();
+  const lim = new TokenBuckets();
+  assert.equal((await handle(tileReq(null), tileEnv({ SESSION_MODE: 'grace' }), undefined, lim)).status, 200);
+  assert.equal((await handle(tileReq('v1.x.y'), tileEnv({ SESSION_MODE: 'grace' }), undefined, lim)).status, 401);
+  assert.equal((await handle(tileReq('v1.x.y'), tileEnv({ SESSION_MODE: 'off' }), undefined, lim)).status, 200);
+  assert.equal((await handle(tileReq(null, '9.9.9.9', '/adsb/tile/2026-11-05/263364.json'), {}, undefined, lim)).status, 501, 'default env: off (no INDEX -> 501, not 401)');
+});
+
+test('per-session budget on top of per-IP (same limits, own key)', async () => {
+  stubs();
+  const calls = [];
+  const env = tileEnv({ RL_TILE: { limit: async ({ key }) => { calls.push(key); return { success: true }; } } });
+  const s = await signSession(KEY, { ip: '9.9.9.9' });
+  await handle(tileReq(s.token), env, undefined, new TokenBuckets());
+  assert.deepEqual(calls, ['tile:9.9.9.9', `tile:s:${s.id}`]);
+  const lim = new TokenBuckets();
+  for (let i = 0; i < LIMITS.tile.limit; i++) lim.take(`tile:s:${s.id}`, LIMITS.tile.limit, LIMITS.tile.period);
+  const r = await handle(tileReq(s.token), tileEnv(), undefined, lim);
+  assert.equal(r.status, 429);
+});
+
+test('CORS: preflight allows + exposes X-Doppler-Session and POST, cached a day', async () => {
+  const r = await handle(new Request('https://w.example/adsb/tile/2026-11-06/263364.json', { method: 'OPTIONS', headers: { Origin: APP } }), tileEnv());
+  assert.equal(r.status, 204);
+  assert.match(r.headers.get('Access-Control-Allow-Headers'), /X-Doppler-Session/);
+  assert.match(r.headers.get('Access-Control-Expose-Headers'), /X-Doppler-Session/);
+  assert.match(r.headers.get('Access-Control-Allow-Methods'), /POST/);
+  assert.equal(r.headers.get('Access-Control-Max-Age'), '86400');
+});
+
+test('range: GitHub 504 / network error retried in the Worker (3 attempts) before a 502 with Retry-After', async () => {
+  const { RANGE_RETRY } = await import('../src/index.js');
+  const saved = RANGE_RETRY.backoffMs;
+  RANGE_RETRY.backoffMs = [0, 0];
+  try {
+    stubs();
+    let n = 0;
+    globalThis.fetch = async () => { n++; if (n === 1) throw new TypeError('reset'); if (n === 2) return new Response('gw', { status: 504 }); return new Response(new Uint8Array(10), { status: 206 }); };
+    const go = (s) => handle(new Request(`https://w.example/adsb/range?tag=${TAG}&part=aa&start=${s}&end=${s + 9}`), {}, undefined, new TokenBuckets());
+    const ok = await go(0);
+    assert.deepEqual([ok.status, n], [200, 3]);
+    n = 0;
+    globalThis.fetch = async () => { n++; return new Response('gw', { status: 504 }); };
+    const bad = await go(100);
+    assert.deepEqual([bad.status, n, bad.headers.get('Retry-After')], [502, 3, '5']);
+    n = 0;
+    globalThis.fetch = async () => { n++; return new Response('', { status: 404 }); };
+    assert.deepEqual([(await go(200)).status, n], [404, 1], '404 is final');
+  } finally { RANGE_RETRY.backoffMs = saved; }
 });

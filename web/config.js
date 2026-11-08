@@ -5,9 +5,12 @@
 //   With a Worker, from/to/days are replaced at startup by its availability manifest (/adsb/index/meta/coverage.json,
 //   see web/ui/coverage-gate.js); these values are only the fallback when that fetch fails.
 //   bbox [lat0, lon0, lat1, lon1] (Catalonia + Andorra), from: first UTC day with tiles (YYYY-MM-DD).
+// turnstileSiteKey: Cloudflare Turnstile site key of the production widget (deploy/build.mjs, 2nd argument or
+//   TURNSTILE_SITEKEY). Set = data requests to adsbWorker carry a human session (web/ui/data-session.js). Empty = off.
 // defaultRegion: the editable search area placed when a file is loaded and no area was chosen yet.
 window.OVERHEAD_CONFIG = {
   adsbWorker: '',
+  turnstileSiteKey: '',
   coverage: { bbox: [40.45, 0.10, 42.95, 3.40], from: '2026-10-08' },
   defaultRegion: { center: [41.52, 2.10], radius_m: 10000 },
   maxRadius_m: 30000,

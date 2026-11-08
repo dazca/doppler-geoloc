@@ -15,6 +15,10 @@ workers_dev = false
 # Never "*" in production. The default in src/lib.js (used if this is unset) is the same list.
 ALLOWED_ORIGINS = "https://doppler.azemar.eu,http://localhost:8000,http://127.0.0.1:8000,http://localhost:8080,http://127.0.0.1:8080,http://localhost:8788,http://127.0.0.1:8788,http://localhost:8765,http://127.0.0.1:8765,http://localhost:8766,http://127.0.0.1:8766"
 MAX_RANGE_BYTES = "8388608"
+# Human-only access (Turnstile -> POST /session -> X-Doppler-Session, see worker/README.md "Human sessions").
+#   off: header ignored; grace: checked when sent, missing allowed; enforce: required on every data route.
+# Secrets (never in this file): SESSION_KEY (HMAC key, any long random string), TURNSTILE_SECRET (widget secret).
+SESSION_MODE = "off"
 
 # Per-IP rate limits (Workers Rate Limiting binding; period must be 10 or 60 s). Keep in sync with LIMITS in
 # src/lib.js, which is also the in-isolate fallback when a binding is missing. namespace_id: any unique integer per account.
@@ -37,6 +41,11 @@ simple = { limit = 30, period = 60 }
 name = "RL_TRACE"       # /data/traces
 namespace_id = "91304"
 simple = { limit = 60, period = 60 }
+
+[[ratelimits]]
+name = "RL_SESSION"     # POST /session (one Turnstile siteverify each)
+namespace_id = "91305"
+simple = { limit = 10, period = 60 }
 
 # Pre-built per-cell index shards and tiles (ref/data/build_index.py, build_tiles.py).
 [[r2_buckets]]
