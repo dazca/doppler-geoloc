@@ -736,8 +736,8 @@ function renderCoverage() {
     h('p', {}, t('cov.counts', { n: c.n_aircraft, km: c.radius_km, ph: c.tracks_per_h })), h('ul', {}, ...c.messages.map((m) => h('li', {}, m))));
   if (c.level === 'weak') box.replaceChildren(h('strong', {}, t('cov.weak')), details);
   else box.replaceChildren(h('strong', {}, t('cov.poor')), h('span', {}, t('cov.poor.sub')), details,
-    c.ack ? null : h('div', { class: 'btn-row btn-row--tight' },
-      h('button', { type: 'button', class: 'btn btn--sm', id: 'btn-cov-ack', onclick: guard(async () => { c.ack = true; commit(); await locate(); }) }, t('cov.anyway'))));
+    ...(c.ack ? [] : [h('div', { class: 'btn-row btn-row--tight' },   // replaceChildren would print a literal "null"
+      h('button', { type: 'button', class: 'btn btn--sm', id: 'btn-cov-ack', onclick: guard(async () => { c.ack = true; commit(); await locate(); }) }, t('cov.anyway')))]));
 }
 async function restoreTracks() {
   if (R.tracks.length || !P.flights?.cacheKey) return;
