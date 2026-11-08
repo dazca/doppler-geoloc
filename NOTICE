@@ -2,7 +2,7 @@ doppler-geoloc - third-party data and attributions
 ====================================================
 
 This file lists third-party data used or referenced by this project. It does not grant a licence to the
-project's own code (no licence has been chosen for it yet).
+project's own code: the code is MIT-licensed (see LICENSE); the data below keeps its own licences.
 
 ADS-B flight data - adsb.lol
   Historical traces (github.com/adsblol/globe_history_<year> releases) and the live API (api.adsb.lol).

@@ -76,3 +76,7 @@ Build the deployable bundle (does not deploy): `node deploy/build.mjs https://da
 * Lane reports: [A](docs/LANE_A_REPORT.md) theory/reference, [C](docs/LANE_C_REPORT.md) DSP, [D](docs/LANE_D_REPORT.md) engine,
   [E](docs/LANE_E_REPORT.md) UI, [F](docs/LANE_F_REPORT.md) KSMO, [K](docs/LANE_K_REPORT.md) Catalonia,
   [L](docs/LANE_L_REPORT.md) live mode, [V2](docs/LANE_V2_REPORT.md) more real cases
+
+## Licence
+
+Code: [MIT](LICENSE). ADS-B data and the derived tiles: ODbL 1.0 (adsb.lol). Other third-party data: see [NOTICE](NOTICE).
